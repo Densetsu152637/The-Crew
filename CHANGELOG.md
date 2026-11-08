@@ -6,6 +6,8 @@ Version bumps before 0.13.0 were not committed one by one, so entries before 0.1
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-11-08
+
 ### Changed
 - Token counts in M and B show two decimals (`12.35M`, `2.34B`) instead of one.
 
@@ -129,7 +131,8 @@ First stable release. The [public surface](docs/public-surface.md) now follows s
 ### Added
 - First release as crew-progress, a fork of [savvy-progress](https://github.com/johnnyvizz/claude-kit/tree/main/plugins/savvy-progress) by johnnyvizz (MIT): the main session's own row (model, effort, context, estimated cost, time), a costume per workflow profile and the panel opening at session start.
 
-[Unreleased]: https://github.com/Densetsu152637/The-Crew/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/Densetsu152637/The-Crew/compare/v1.1.2...HEAD
+[1.1.2]: https://github.com/Densetsu152637/The-Crew/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/Densetsu152637/The-Crew/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/Densetsu152637/The-Crew/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/Densetsu152637/The-Crew/compare/v1.0.0...v1.0.1
