@@ -1,6 +1,6 @@
 {
   "name": "the-crew",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Agents panel (/crew) with the main session's own row (model, effort, context, estimated cost, time) and a pixel-crab costume per workflow profile, plus the progress bar above the prompt. A fork of savvy-progress by johnnyvizz (MIT).",
   "author": {
     "name": "Densetsu152637",

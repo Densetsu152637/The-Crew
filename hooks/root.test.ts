@@ -27,7 +27,8 @@ const session = async ($: Engine, on: On) => {
   on('session.measure', (_$, e) => ({ changed: e.changed }))
   on('agent.spawn', () => ({ model: 'claude-haiku-4-5', agentId: 'a1' }))
   on('turn.step', async function* (_$, e) {
-    return { turnId: e.turnId, index: 0, answer: '', toolUses: [], stopReason: 'end_turn', usage: e.agentId ? SUB_USAGE : MAIN_USAGE } as never
+    const usage = (e as { usage?: unknown }).usage ?? (e.agentId ? SUB_USAGE : MAIN_USAGE)
+    return { turnId: e.turnId, index: 0, answer: '', toolUses: [], stopReason: 'end_turn', usage } as never
   })
   await $.session.start({ source: 'startup', cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
 }
@@ -70,6 +71,15 @@ test('root: the totals keep input and output tokens apart', async ($, on) => {
   const ui = await terminal($)
   // Input is the prompt side with cache reads (10K + 190K); output is the 5K written.
   expect(await ui.find({ type: 'Text', text: /≈\$0\.18 · 200k in · 5k out · 1:05/ })).toBeDefined()
+})
+
+test('root: billions of tokens read as B, not thousands of M', async ($, on) => {
+  await session($, on)
+  await $.turn.start({ text: 'hi', turnId: 'm1' } as never)
+  const usage = { ...MAIN_USAGE, cache_read_input_tokens: 2_340_000_000 }
+  await step($, { turnId: 'm1', model: 'claude-opus-5-5', effort: 'high', usage })
+  const ui = await terminal($)
+  expect(await ui.find({ type: 'Text', text: /· 2\.3B in · 5k out ·/ })).toBeDefined()
 })
 
 test("root: the engine's measure replaces the window figures", async ($, on) => {

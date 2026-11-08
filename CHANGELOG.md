@@ -6,6 +6,9 @@ Version bumps before 0.13.0 were not committed one by one, so entries before 0.1
 
 ## [Unreleased]
 
+### Fixed
+- Token counts of a billion or more read as B (`2.3B`) instead of thousands of M (`2340.0M`).
+
 ## [1.1.0] - 2026-11-01
 
 ### Added
