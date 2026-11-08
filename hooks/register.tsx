@@ -432,9 +432,9 @@ const modelName = (id: string): string => {
 const norm = (s: string): string => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim()
 
 const fmtTokens = (n: number): string =>
-  n >= 1e9 ? `${(n / 1e9).toFixed(1)}B` : n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : `${Math.round(n)}`
+  n >= 1e9 ? `${(n / 1e9).toFixed(2)}B` : n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : `${Math.round(n)}`
 
-// "12M in · 45k out".
+// "12.34M in · 45k out".
 const fmtInOut = (t: { input: number; output: number }): string => `${fmtTokens(t.input)} ${tr().inWord} · ${fmtTokens(t.output)} ${tr().outWord}`
 
 const fmtCost = (usd: number): string => `$${usd < 10 ? usd.toFixed(2) : usd.toFixed(1)}`

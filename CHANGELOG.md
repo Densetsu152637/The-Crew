@@ -6,6 +6,9 @@ Version bumps before 0.13.0 were not committed one by one, so entries before 0.1
 
 ## [Unreleased]
 
+### Changed
+- Token counts in M and B show two decimals (`12.35M`, `2.34B`) instead of one.
+
 ## [1.1.1] - 2026-11-08
 
 ### Fixed

@@ -79,7 +79,16 @@ test('root: billions of tokens read as B, not thousands of M', async ($, on) => 
   const usage = { ...MAIN_USAGE, cache_read_input_tokens: 2_340_000_000 }
   await step($, { turnId: 'm1', model: 'claude-opus-5-5', effort: 'high', usage })
   const ui = await terminal($)
-  expect(await ui.find({ type: 'Text', text: /· 2\.3B in · 5k out ·/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /· 2\.34B in · 5k out ·/ })).toBeDefined()
+})
+
+test('root: millions of tokens keep two decimals', async ($, on) => {
+  await session($, on)
+  await $.turn.start({ text: 'hi', turnId: 'm1' } as never)
+  const usage = { ...MAIN_USAGE, cache_read_input_tokens: 12_340_000 }
+  await step($, { turnId: 'm1', model: 'claude-opus-5-5', effort: 'high', usage })
+  const ui = await terminal($)
+  expect(await ui.find({ type: 'Text', text: /· 12\.35M in · 5k out ·/ })).toBeDefined()
 })
 
 test("root: the engine's measure replaces the window figures", async ($, on) => {
