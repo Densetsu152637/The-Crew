@@ -113,6 +113,12 @@ export const CRAB_CSS = `<style>
 @media (prefers-reduced-motion: reduce){.run,.run g{animation:none!important}}
 </style>`
 
+// CRAB_CSS less the props' rules of other costumes: what a drawing of `costumes` needs.
+export const crabCss = (costumes: readonly string[]): string =>
+  CRAB_CSS.split('\n')
+    .filter(l => !l.startsWith('.c-') || costumes.some(c => l.startsWith(`.c-${c}.`)))
+    .join('\n')
+
 export const COSTUMES: Record<string, (f: Fill, t: string) => void> = {
   // Root: the main session, crowned; the jewels glint and the sparkle twinkles.
   root: (f, t) => {
@@ -263,17 +269,23 @@ export const CRAB_SCALE = 1.1
 
 // Body and props nest inside `bd` so a prop rides the bob and adds its own motion;
 // legs stay outside it and step on their own.
+// A group's pixels are paths, one per run of a colour in paint order, so a crab is a
+// few KB rather than a rect per pixel: the pane's whole drawing has a size bound.
 export const crab = (x: number, y: number, costume: string, dim = false, isWalking = false, scale = CRAB_SCALE): string => {
-  const groups = new Map<string, string[]>([['bd', []]])
+  const groups = new Map<string, { c: string; d: string }[]>([['bd', []]])
   const f: Fill = (cx, cy, w, h, c, cls = 'bd') => {
     if (!groups.has(cls)) groups.set(cls, [])
-    groups.get(cls)?.push(`<rect x="${cx}" y="${cy}" width="${w}" height="${h}" fill="${c}"/>`)
+    const runs = groups.get(cls) ?? []
+    const box = `M${cx} ${cy}h${w}v${h}h-${w}z`
+    const last = runs[runs.length - 1]
+    if (last?.c === c) last.d += box
+    else runs.push({ c, d: box })
   }
   const draw = COSTUMES[costume] ?? ((g: Fill) => crabBody(g))
   draw(f, colorOf(costume))
-  const group = (cls: string) => `<g class="${cls}">${(groups.get(cls) ?? []).join('')}</g>`
+  const group = (cls: string) => `<g class="${cls}">${(groups.get(cls) ?? []).map(r => `<path fill="${r.c}" d="${r.d}"/>`).join('')}</g>`
   const props = [...groups.keys()].filter(k => k !== 'bd' && k !== 'la' && k !== 'lb')
-  const body = `<g class="bd">${(groups.get('bd') ?? []).join('')}${props.map(group).join('')}</g>`
+  const body = `<g class="bd">${(groups.get('bd') ?? []).map(r => `<path fill="${r.c}" d="${r.d}"/>`).join('')}${props.map(group).join('')}</g>`
   const place = `translate(${x},${y}) scale(${scale})`
   return `<g transform="${place}" opacity="${dim ? 0.45 : 1}" shape-rendering="crispEdges"><g class="c-${costume}${isWalking ? ' run' : ''}">${body}${group('la')}${group('lb')}</g></g>`
 }

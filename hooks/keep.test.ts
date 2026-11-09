@@ -92,15 +92,21 @@ const COPY = {
   },
 }
 
-test('keep: a finished subagent and its conversation are copied to the store', async ($, on) => {
+test('keep: a finished subagent is copied to the store, its conversation only once its thread was open', async ($, on) => {
   const held = memoryStore(on)
   await process($, on, 'sess-1', THREAD)
   await runSubagent($)
   const copy = held.get('session:sess-1') as typeof COPY
   expect(copy.agents.map(a => a.agentId)).toEqual(['a1'])
-  expect(copy.threads.a1?.map(m => m.text)).toEqual(['Check the build.', 'Looking at the config.', 'The build is fine.'])
+  // Nothing keeps a subagent's conversation while no thread is open.
+  expect(copy.threads).toEqual({})
+  const ui = await mount($)
+  await ui.press({ key: 'view-a1' })
+  await $.turn.complete({ turnId: 'm1', reason: 'answer', answer: 'ok', durationMs: 1, isAborted: false } as never)
+  const viewed = held.get('session:sess-1') as typeof COPY
+  expect(viewed.threads.a1?.map(m => m.text)).toEqual(['Check the build.', 'Looking at the config.', 'The build is fine.'])
   // A tool call keeps only the arguments its line shows.
-  expect((copy.threads.a1?.[1] as { toolUses: { input: unknown }[] }).toolUses[0]?.input).toEqual({ file_path: '/repo/build.json' })
+  expect((viewed.threads.a1?.[1] as { toolUses: { input: unknown }[] }).toolUses[0]?.input).toEqual({ file_path: '/repo/build.json' })
   expect(held.get('sessions')).toEqual(['sess-1'])
 })
 

@@ -6,6 +6,18 @@ Version bumps before 0.13.0 were not committed one by one, so entries before 0.1
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-09
+
+### Fixed
+- The panel no longer goes blank ("Nothing to show yet") in a long session with many subagents. The engine refuses a pane whose tree passes 100,000 characters serialized, and a 20-subagent session drew about 255,000. Every pane drawing is now spent from an 80,000-character budget: the newest rows are drawn in full while it lasts, keeping room for up to 40 more agents as one-line rows (title, which still opens the thread, and state), and any past those are counted on a `+N more not shown` line. The same session now draws about 79,000.
+
+### Changed
+- Crab drawings are paths, one per run of a colour, instead of a rect per pixel (about a quarter of the size), and a walking crab carries only its own costume's motion rules.
+- A running time's glyphs inherit their styling from their strip, and the slow strips carry only the glyphs the next redraw can reach (a running row's text drawing went from about 18,000 to 3,000 characters).
+- Each drawing carries the colour rules of the classes it uses, not all of them.
+- A subagent's thread reads like the main transcript: its brief (cut to 1,200 characters), its replies, and each run of tool calls between them as one summary line (`Read 3 files, ran 2 commands`) instead of a line per call. Tool results are left out. The thread's size is spent from the same tree budget, newest first.
+- A subagent's conversation is read only while its thread is open. Ending a subagent's turn no longer reads it, so the copy kept for a resumed session holds the conversations of threads that were opened.
+
 ## [1.1.2] - 2026-11-08
 
 ### Changed
@@ -131,7 +143,8 @@ First stable release. The [public surface](docs/public-surface.md) now follows s
 ### Added
 - First release as crew-progress, a fork of [savvy-progress](https://github.com/johnnyvizz/claude-kit/tree/main/plugins/savvy-progress) by johnnyvizz (MIT): the main session's own row (model, effort, context, estimated cost, time), a costume per workflow profile and the panel opening at session start.
 
-[Unreleased]: https://github.com/Densetsu152637/The-Crew/compare/v1.1.2...HEAD
+[Unreleased]: https://github.com/Densetsu152637/The-Crew/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/Densetsu152637/The-Crew/compare/v1.1.2...v1.2.0
 [1.1.2]: https://github.com/Densetsu152637/The-Crew/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/Densetsu152637/The-Crew/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/Densetsu152637/The-Crew/compare/v1.0.1...v1.1.0

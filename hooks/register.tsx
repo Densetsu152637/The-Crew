@@ -3,9 +3,9 @@ import type { EngineInterface, Register, SessionContextUsage, SessionMessage, Se
 
 import type { AgentRun, Flow, Panel, Phase, PlannedTask } from '../types'
 
-import { AGENT_CHARS, INDEX_KEY, keepThread, keepThreads, reviveSnapshot, snapshotKey, TOOL_ARG_KEYS, touchIndex } from './keep'
+import { AGENT_CHARS, INDEX_KEY, keepThread, keepThreads, reviveSnapshot, snapshotKey, touchIndex } from './keep'
 import type { KeptMessage, Snapshot } from './keep'
-import { CLAY, COSTUMES, CRAB_BOX, CRAB_CSS, CRAB_SCALE, crab, colorOf, TIER_COLOR } from './crabs'
+import { CLAY, COSTUMES, CRAB_BOX, CRAB_CSS, CRAB_SCALE, crab, crabCss, colorOf, TIER_COLOR } from './crabs'
 
 // the-crew: a fork of johnnyvizz's savvy-progress (MIT) that adds the main
 // session's own row and a costume per workflow profile. Every namespace below
@@ -105,6 +105,7 @@ const STRINGS = {
     isIdle: 'idle',
     backToAgents: 'Agents',
     noThread: 'No messages yet.',
+    hidden: 'more not shown',
     tier: {
       light: 'light', medium: 'medium', careful: 'careful', heavy: 'heavy', fable: 'fable', other: 'other',
       root: 'root', manager: 'manager', explorer: 'explorer', implementer: 'implementer', validator: 'validator',
@@ -524,10 +525,22 @@ const gridSvg = (W: number, H: number) => `<svg xmlns="http://www.w3.org/2000/sv
 <rect width="${W}" height="${H}" fill="url(#g)"/>
 </svg>`
 
-const PANE_CSS = `<style>
-.t{fill:#1f1f1f}.s{fill:#6b6b68}.m{fill:#9a9a96}.k{fill:#ecebe8}.ln{stroke:#e4e4e1}.tile{fill:#f4f3f0}
-@media (prefers-color-scheme: dark){.t{fill:#ececec}.s{fill:#a8a8a4}.m{fill:#7d7d79}.k{fill:#2c2c2b}.ln{stroke:#333331}.tile{fill:#262625}}
-</style>`
+// Per class: the property it sets, its light colour and its dark one. A drawing carries the rules of the
+// classes it uses, as every character of the pane counts against its tree's bound (TREE_CHARS).
+const PANE_CLASSES: [cls: string, prop: string, light: string, dark: string][] = [
+  ['t', 'fill', '#1f1f1f', '#ececec'],
+  ['s', 'fill', '#6b6b68', '#a8a8a4'],
+  ['m', 'fill', '#9a9a96', '#7d7d79'],
+  ['k', 'fill', '#ecebe8', '#2c2c2b'],
+  ['ln', 'stroke', '#e4e4e1', '#333331'],
+  ['tile', 'fill', '#f4f3f0', '#262625'],
+]
+const paneCss = (body: string): string => {
+  const used = PANE_CLASSES.filter(([cls]) => body.includes(`class="${cls}"`) || body.includes(`class="${cls} `))
+  if (!used.length) return ''
+  const rules = (dark: boolean) => used.map(([cls, prop, light, night]) => `.${cls}{${prop}:${dark ? night : light}}`).join('')
+  return `<style>${rules(false)}@media (prefers-color-scheme: dark){${rules(true)}}</style>`
+}
 
 // Only a drawing with a running mark carries this; finished and idle drawings hold no animation.
 const LIVE_CSS = `<style>.live{animation:p 1.6s ease-in-out infinite}@keyframes p{50%{opacity:.3}}
@@ -587,8 +600,12 @@ const clock = (x: number, y: number, size: number, ms: number, attrs: string): s
     const n = s.glyphs.length
     const period = n * s.unit
     rules.push(`.q${rules.length}{animation:q${n}x${lh} ${period}s steps(${n}) -${((ms / 1000) % period).toFixed(2)}s infinite}`)
-    const glyphs = s.glyphs.map((g, i) => (g ? `<text ${endText(w, base + i * lh)}${attrs}>${g}</text>` : '')).join('')
-    return `<svg x="${right - w}" y="${y - base}" width="${w}" height="${lh}" overflow="hidden"><g class="q${rules.length - 1}">${glyphs}</g></svg>`
+    // The glyphs inherit the strip's styling: written on each of them, a running row's clock was ~18k characters.
+    // A strip slower than the minute's redraw carries only the glyphs it can reach before then.
+    const at = Math.floor(((ms / 1000) % period) / s.unit)
+    const isNear = (i: number) => s.unit < DESKTOP_MS / 1000 || (i - at + n) % n <= 2
+    const glyphs = s.glyphs.map((g, i) => (g && isNear(i) ? `<text x="${w}" y="${base + i * lh}">${g}</text>` : '')).join('')
+    return `<svg x="${right - w}" y="${y - base}" width="${w}" height="${lh}" overflow="hidden"><g text-anchor="end"${attrs}><g class="q${rules.length - 1}">${glyphs}</g></g></svg>`
   }
   const colon = x - 2 * dw - colonW(size) / 2
   const cells = [
@@ -608,23 +625,73 @@ const crabWidth = (scale: number): number => Math.round(CRAB_BOX * scale * 100) 
 const rowCrab = (x: number, y: number, costume: string, dim = false, isWalking = false): string =>
   crab(x, y, costume, dim, isWalking, CRAB_SCALE)
 
-// A thread in the pane: its newest messages, each cut to THREAD_TEXT, as many as fit
-// THREAD_CHARS. A drawing holds 100000 characters and cuts from the end, which is
-// where the newest messages are, so the budget is spent newest first.
+// The engine refuses a pane whose tree passes 100,000 characters serialized (or 20,000 nodes), and the
+// desktop then shows the pane empty. A long session's rows passed it, so every drawing the pane returns
+// is spent from this budget, with room left for the elements around them.
+const TREE_CHARS = 80_000
+// What an agent's one-line row (past the budget for drawn rows) adds to the tree, at most.
+const LITE_COST = 500
+// How many one-line rows the drawn rows leave room for.
+const LITE_KEPT = 40
+// A thread in the pane: its newest messages, each cut to THREAD_TEXT (the brief to BRIEF_TEXT), as many as
+// fit what the tree budget leaves, spent newest first.
 const THREAD_TEXT = 4000
-const THREAD_CHARS = 90000
+const BRIEF_TEXT = 1200
 
-// One line per tool call in a thread: the tool, and the argument that says most about it.
-const toolLine = (use: { tool: string; input: Record<string, unknown> }): string => {
-  const arg = TOOL_ARG_KEYS.map(k => use.input[k]).find(v => typeof v === 'string' && v)
-  const name = use.tool.startsWith('mcp__') ? use.tool.split('__').slice(2).join('__') || use.tool : use.tool
-  return typeof arg === 'string' ? `${name} · ${arg.replace(/\s+/g, ' ')}` : name
+// A run of tool calls in a thread is one line, as the main transcript groups them: "Read 3 files, ran 2 commands".
+const TOOL_GROUPS: [RegExp, (n: number) => string][] = [
+  [/^Read$/, n => `read ${n} file${n > 1 ? 's' : ''}`],
+  [/^(Edit|MultiEdit|Write|NotebookEdit)$/, n => `edited ${n} file${n > 1 ? 's' : ''}`],
+  [/^(Bash|PowerShell)$/, n => `ran ${n} command${n > 1 ? 's' : ''}`],
+  [/^(Grep|Glob)$/, n => `searched ${n} pattern${n > 1 ? 's' : ''}`],
+  [/^(WebFetch|WebSearch)$/, n => `looked up ${n} page${n > 1 ? 's' : ''}`],
+  [/^(Agent|Task)$/, n => `started ${n} agent${n > 1 ? 's' : ''}`],
+]
+
+const toolSummary = (tools: readonly string[]): string => {
+  const counts = new Map<string, { n: number; say: (n: number) => string }>()
+  for (const tool of tools) {
+    const name = tool.startsWith('mcp__') ? tool.split('__').slice(2).join('__') || tool : tool
+    const group = TOOL_GROUPS.find(([re]) => re.test(name))
+    const key = group ? group[0].source : name
+    const say = group ? group[1] : (n: number) => (n > 1 ? `${name} ×${n}` : name)
+    counts.set(key, { n: (counts.get(key)?.n ?? 0) + 1, say })
+  }
+  const line = [...counts.values()].map(c => c.say(c.n)).join(', ')
+  return line.charAt(0).toUpperCase() + line.slice(1)
+}
+
+// A thread as the transcript reads: each message's words, and each run of tool calls between them as one
+// summary line. A tool result carries no words of its own and is left out.
+type ThreadItem = { kind: 'text'; isUser: boolean; text: string } | { kind: 'tools'; tools: string[] }
+
+const threadItems = (messages: readonly SessionMessage[]): ThreadItem[] => {
+  const items: ThreadItem[] = []
+  let isFirstUser = true
+  for (const m of messages) {
+    if (m.text.trim()) {
+      const isUser = m.role === 'user'
+      items.push({ kind: 'text', isUser, text: clip(m.text.trim(), isUser && isFirstUser ? BRIEF_TEXT : THREAD_TEXT) })
+      if (isUser) isFirstUser = false
+    }
+    if (m.toolUses.length === 0) continue
+    const last = items[items.length - 1]
+    if (last?.kind === 'tools') last.tools.push(...m.toolUses.map(u => u.tool))
+    else items.push({ kind: 'tools', tools: m.toolUses.map(u => u.tool) })
+  }
+  return items
 }
 
 // Each row is its own SVG, so each carries the motion CSS only when its body uses it:
 // a pulsing mark (`live`) or a walking crab (`run`).
 const svg = (W: number, H: number, body: string): string =>
-  `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">${PANE_CSS}${body.includes('class="live"') ? LIVE_CSS : ''}${body.includes(' run"') ? CRAB_CSS : ''}${body}</svg>`
+  `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">${paneCss(body)}${body.includes('class="live"') ? LIVE_CSS : ''}${runningCrabCss(body)}${body}</svg>`
+
+// The crab motion a drawing's walking crabs use, their own props' rules only.
+const runningCrabCss = (body: string): string => {
+  const walking = [...body.matchAll(/class="c-([a-z-]+) run"/g)].map(m => m[1] ?? '')
+  return walking.length ? crabCss(walking) : ''
+}
 
 // The pane's own title already says "Agents": the header names the flow, if any.
 // `isTicking`: the time runs on, and counts by itself (see `clock`).
@@ -1351,12 +1418,7 @@ export const register: Register = (on, options) => {
       const at = await $.clock.now()
       touchThread(agentId)
       finishedAgents.add(agentId)
-      // Its conversation is whole now: keep it for a session resumed later.
-      try {
-        keepConversation(agentId, await $.session.messages({ agentId }))
-      } catch {
-        // Nothing to keep from this host.
-      }
+      // Its conversation is read only while its thread is open (the render keeps that copy); a row follows its events alone.
       await update($, agents, list =>
         list.map((a): AgentRun => {
           if (a.agentId !== agentId) return a
@@ -1513,6 +1575,10 @@ export const register: Register = (on, options) => {
         </Box>
       )
 
+      // What a row adds to the serialized tree: its three drawings, their alts and the elements around them.
+      const rowCost = (a: AgentRun, view: boolean): number =>
+        crabDrawing(a).length + agentDrawing(W, a, !view).length + markDrawing(a).length + 3 * a.description.length + 600
+
       // A subagent's row: pressing its title opens its thread in the pane, in place
       // of the agents (the desktop app keeps its main view to itself). Neither an
       // Svg nor a Box takes a press, so the title is a Button laid over the row.
@@ -1551,26 +1617,29 @@ export const register: Register = (on, options) => {
           threads.set(viewing.agentId, cached)
         }
         const found = cached.found
-        let budget = THREAD_CHARS
-        let first = 'deny' in found ? 0 : found.length
-        while (!('deny' in found) && first > 0) {
-          const m = found[first - 1]
-          const cost = Math.min(m?.text.length ?? 0, THREAD_TEXT) + (m?.toolUses.length ?? 0) * 120
-          if (cost > budget && first < found.length) break
+        const items = 'deny' in found ? [] : threadItems(found)
+        // What the tree has left after the row and the back buttons, spent newest first; JSON's escapes count.
+        let budget = TREE_CHARS - rowCost(viewing, false) - 1000
+        let first = items.length
+        while (first > 0) {
+          const it = items[first - 1]
+          const cost = (it?.kind === 'text' ? JSON.stringify(it.text).length : 0) + 150
+          if (cost > budget && first < items.length) break
           budget -= cost
           first--
         }
         const thread =
           'deny' in found
             ? [<Text key="deny" dimColor>{found.deny}</Text>]
-            : found.slice(first).flatMap((m, i) => [
-                ...(m.text ? [<Markdown key={`m-${i}`} text={clip(m.text, THREAD_TEXT)} dimColor={m.role === 'user'} />] : []),
-                ...m.toolUses.map((u, j) => (
-                  <Text key={`t-${i}-${j}`} dimColor wrap="truncate-end">
-                    {`→ ${toolLine(u)}`}
+            : items.slice(first).map((it, i) =>
+                it.kind === 'text' ? (
+                  <Markdown key={`m-${i}`} text={it.text} dimColor={it.isUser} />
+                ) : (
+                  <Text key={`t-${i}`} dimColor wrap="truncate-end">
+                    {`⎿ ${toolSummary(it.tools)}`}
                   </Text>
-                )),
-              ])
+                ),
+              )
         return (
           <Box flexDirection="column" gap={1}>
             {back('back')}
@@ -1590,9 +1659,54 @@ export const register: Register = (on, options) => {
           </Box>
         )
       }
-      const shownDone = p.isDoneCollapsed ? 0 : finished.length
-      const lines = 1 + (isEmpty ? 1 : 0) + (running.length > 0 ? 1 : 0) + (finished.length > 0 ? 1 : 0) + (planned.length > 0 ? 1 : 0)
-      const gridH = headerHeight(title) + lines * LINE_H + ((main ? 1 : 0) + running.length + shownDone) * 66 + planned.length * 46
+      // Rows are drawn in order (running, then finished newest first) while the tree budget lasts, keeping
+      // room for up to LITE_KEPT later agents as one-line rows; past that budget the rest are one-line rows,
+      // and past even those, counted on one line. Planned tasks take what is left. Section counts stay whole.
+      let room = TREE_CHARS - header.length - 3000 - (main ? rowCost(main, false) : 0)
+      const listed = [...running, ...(p.isDoneCollapsed ? [] : finished)]
+      const full = new Set<AgentRun>()
+      const lite = new Set<AgentRun>()
+      listed.forEach((a, i) => {
+        const cost = rowCost(a, Boolean(a.agentId))
+        if (lite.size === 0 && cost + Math.min(listed.length - i - 1, LITE_KEPT) * LITE_COST <= room) {
+          room -= cost
+          full.add(a)
+        } else if (LITE_COST <= room) {
+          room -= LITE_COST
+          lite.add(a)
+        }
+      })
+      const plannedDrawing = (pl: Planned) => memo.get(`p${JSON.stringify([W, pl])}`, () => plannedSvg(W, pl))
+      const shownPlanned: Planned[] = []
+      for (const pl of planned) {
+        const cost = plannedDrawing(pl).length + pl.title.length + 300
+        if (cost > room) break
+        room -= cost
+        shownPlanned.push(pl)
+      }
+      const hidden = listed.length - full.size - lite.size + planned.length - shownPlanned.length
+      // One line per agent past the budget: its title (opening its thread) and its state in words.
+      const liteRow = (a: AgentRun) => (
+        <Box key={`lite-${a.id}`} flexDirection="row" gap={1}>
+          {a.agentId ? (
+            <Button
+              key={`view-${a.id}`}
+              label={fitText(a.description || a.type, 13, W / 2)}
+              plain
+              onPress={() => openThread($, a.id, a.agentId ?? '', () => touchThread(a.agentId))}
+            />
+          ) : (
+            <Text wrap="truncate-end">{fitText(a.description || a.type, 13, W / 2)}</Text>
+          )}
+          <Text dimColor wrap="truncate-end">
+            {`${STATUS_GLYPH[a.status]} ${roleLabel(a)} · ${runModel(a)} · ≈${fmtCost(a.costUsd)} · ${fmtTime(elapsed(a, at))}`}
+          </Text>
+        </Box>
+      )
+      const row = (a: AgentRun, state: string) => (full.has(a) ? agentRow(a, state) : lite.has(a) ? liteRow(a) : null)
+      const lines =
+        1 + (isEmpty ? 1 : 0) + (running.length > 0 ? 1 : 0) + (finished.length > 0 ? 1 : 0) + (planned.length > 0 ? 1 : 0) + (hidden > 0 ? 1 : 0)
+      const gridH = headerHeight(title) + (lines + lite.size) * LINE_H + ((main ? 1 : 0) + full.size) * 66 + shownPlanned.length * 46
       return (
         <Box flexDirection="column">
           {/* The grid sizes the pane; the content is placed over it, as an
@@ -1606,14 +1720,14 @@ export const register: Register = (on, options) => {
             {main && drawn(main, `${main.description}: ${modelName(main.model)}, ${main.status === 'running' ? s.isRunning : s.isIdle}`)}
             {isEmpty && <Text dimColor>{s.empty}</Text>}
             {running.length > 0 && section('h-run', `${s.running} · ${running.length}`)}
-            {running.map(a => agentRow(a, s.isRunning))}
+            {running.map(a => row(a, s.isRunning))}
             {finished.length > 0 && toggleDone}
-            {!p.isDoneCollapsed &&
-              finished.map(a => agentRow(a, s.isFinished))}
+            {!p.isDoneCollapsed && finished.map(a => row(a, s.isFinished))}
             {planned.length > 0 && section('h-plan', `${s.planned} · ${planned.length}`)}
-            {planned.map(pl => (
-              <Svg key={`plan-${pl.n}`} source={memo.get(`p${JSON.stringify([W, pl])}`, () => plannedSvg(W, pl))} alt={`${pl.n}. ${pl.title}: ${s.isPlanned}`} width={W} height={46} />
+            {shownPlanned.map(pl => (
+              <Svg key={`plan-${pl.n}`} source={plannedDrawing(pl)} alt={`${pl.n}. ${pl.title}: ${s.isPlanned}`} width={W} height={46} />
             ))}
+            {hidden > 0 && section('h-hidden', `+${hidden} ${s.hidden}`)}
           </Box>
         </Box>
       )

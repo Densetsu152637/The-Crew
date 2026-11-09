@@ -56,7 +56,8 @@ test("view: pressing a subagent's row opens its thread in place of the agents", 
   expect((await thread.find({ type: 'Button', key: 'back' }))?.props.label).toBe('‹ Agents')
   const texts = (await thread.findAll({ type: 'Markdown' })).map(el => String(el.props.text))
   expect(texts).toEqual(['Check the build.', 'Looking at the config.', 'The build is fine.'])
-  expect(await thread.find({ type: 'Text', text: /→ Read · \/repo\/build\.json/ })).toBeDefined()
+  // Tool calls read as the transcript groups them, one line per run, without their arguments.
+  expect((await thread.find({ type: 'Text', text: /⎿/ }))?.text).toBe('⎿ Read 1 file')
   // The agents list is gone while the thread shows: only the viewed run's row is drawn.
   // The row is its crab, its text and its status mark.
   expect((await thread.findAll({ type: 'Svg' })).map(el => String(el.props.alt))).toEqual(['tester crab', 'Side work: Haiku 4.5', 'running'])

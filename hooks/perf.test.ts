@@ -187,8 +187,8 @@ test('clock: each place starts where the elapsed time is in its cycle', async ($
     { glyphs: 10, period: 600, delay: 157.5 },
     { glyphs: 60, period: 36000, delay: 157.5 },
   ])
-  // The head strip reads nothing under ten minutes, and 1:0 for the second hour's first ten minutes.
-  expect(row).toContain('>1:0</text>')
+  // The slow strips carry only the glyphs the next redraw can reach: none of the second hour's yet.
+  expect(row).not.toContain('>1:0</text>')
 })
 
 test('clock: a desktop panel ticks once a minute, a text panel every second', async ($, on) => {
@@ -284,9 +284,9 @@ test('thread: closing the thread stops the fetches', async ($, on) => {
   const before = calls.messages
   await note($, 'a1', 'After close.')
   expect(calls.messages).toBe(before)
-  // The agent's last turn reads its conversation once more, to keep it for a resumed session; nothing else does.
+  // Its turn ending reads nothing either: a conversation is read only while its thread is open.
   await finish($)
-  expect(calls.messages).toBe(before + 1)
+  expect(calls.messages).toBe(before)
   await ui.unmount()
 })
 

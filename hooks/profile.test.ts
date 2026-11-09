@@ -150,8 +150,11 @@ test('every profile has its own costume', async ($, on) => {
     'manager', 'explorer', 'implementer', 'validator', 'critic', 'documenter', 'tester',
     'researcher', 'debugger', 'analyst', 'architect', 'auditor', 'navigator', 'inspector',
   ]
-  for (const p of profiles) await spawn($, `As ${p}`, 'general-purpose', `Role: leaf; Profile: ${p}\nGo.`)
-  for (const p of profiles) expectRole(await rowOf($, `As ${p}`), p)
+  // Each is checked as it starts: the newest running row, which is always drawn whole.
+  for (const p of profiles) {
+    await spawn($, `As ${p}`, 'general-purpose', `Role: leaf; Profile: ${p}\nGo.`)
+    expectRole(await rowOf($, `As ${p}`), p)
+  }
 })
 
 test('savvy workers still get the step line; a tagged brief is left as written', async ($, on) => {
