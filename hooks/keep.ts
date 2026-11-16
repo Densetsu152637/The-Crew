@@ -220,3 +220,12 @@ export function touchIndex(index: unknown, id: string, bytes: number, budget = S
   }
   return { index: kept, dropped }
 }
+
+/** The index with `id` moved first, its size kept; unchanged when it holds no `id`. A session in use again is kept longest. */
+export function promote(index: unknown, id: string): IndexEntry[] | undefined {
+  const all = readIndex(index)
+  const at = all.findIndex(e => e.id === id)
+  if (at <= 0) return undefined
+  const [entry] = all.splice(at, 1)
+  return entry ? [entry, ...all] : undefined
+}

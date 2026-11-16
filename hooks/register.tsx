@@ -3,7 +3,8 @@ import type { EngineInterface, Register, SessionContextUsage, SessionMessage, Se
 
 import type { AgentRun, Flow, Panel, Phase, PlannedTask } from '../types'
 
-import { INDEX_KEY, fitSnapshot, hasTelemetry, jsonBytes, readIndex, reviveSnapshot, snapshotKey, touchIndex } from './keep'
+import { INDEX_KEY, fitSnapshot, hasTelemetry, jsonBytes, promote, readIndex, reviveSnapshot, snapshotKey, touchIndex } from './keep'
+import { recordRoots, resetArchiveScan, scanArchived } from './archive'
 import type { Snapshot } from './keep'
 import { CLAY, COSTUMES, CRAB_BOX, CRAB_CSS, CRAB_SCALE, crab, crabCss, colorOf, TIER_COLOR } from './crabs'
 
@@ -996,6 +997,40 @@ async function sweepStore($: EngineInterface): Promise<void> {
   for (const key of await $.store.keys()) if (key.startsWith('session:') && !known.has(key)) await $.store.delete(key)
 }
 
+// A session opened again goes first in the index, so one in use is the last to be dropped, however old.
+async function promoteSession($: EngineInterface): Promise<void> {
+  const index = promote(await $.store.get(INDEX_KEY), sessionId)
+  if (index) await $.store.set(INDEX_KEY, index)
+}
+
+// Copies of sessions the desktop app has archived are let go at once (see archive.ts); the open session's never.
+const ARCHIVE_SCAN_MS = 5 * 60_000
+let archiveTimer: Timer | undefined
+let isScanning = false
+async function discardArchived($: EngineInterface): Promise<void> {
+  if (isScanning) return
+  isScanning = true
+  try {
+    const roots = recordRoots({
+      LOCALAPPDATA: await $.env.get('LOCALAPPDATA'),
+      APPDATA: await $.env.get('APPDATA'),
+      HOME: await $.env.get('HOME'),
+      USERPROFILE: await $.env.get('USERPROFILE'),
+    })
+    const archived = await scanArchived($, roots)
+    archived.delete(sessionId)
+    if (archived.size === 0) return
+    const index = readIndex(await $.store.get(INDEX_KEY))
+    const kept = index.filter(e => !archived.has(e.id))
+    for (const e of index) if (archived.has(e.id)) await $.store.delete(snapshotKey(e.id))
+    if (kept.length !== index.length) await $.store.set(INDEX_KEY, kept)
+  } catch {
+    // Tried again at the next scan.
+  } finally {
+    isScanning = false
+  }
+}
+
 async function saveSnapshot($: EngineInterface): Promise<void> {
   saveTimer = undefined
   if (!sessionId) return
@@ -1121,7 +1156,28 @@ async function adoptAgent($: EngineInterface, agentId: string, at: number, promp
   return true
 }
 
+// CALIBRATION (dev build only, removed before release): what the desktop pane reports as it scrolls, next
+// to the height the panel drew, so its scroll unit can be measured. Kept under `calibration` in the store.
+let lastDrawn: { gridH: number; offset: number; bodyRows: number; columns: number } | undefined
+const samples: unknown[] = []
+async function sample($: EngineInterface, kind: string, data: Record<string, unknown>): Promise<void> {
+  samples.push({ kind, at: await $.clock.now(), ...data, drawn: lastDrawn })
+  if (samples.length > 60) samples.splice(0, samples.length - 60)
+  try {
+    await $.store.set('calibration', samples)
+  } catch {
+    // Not needed for the panel.
+  }
+}
+
 export const register: Register = (on, options) => {
+  on('ui.scroll', async ($, e, next) => {
+    const moved = await next(e)
+    const s = e as unknown as { requestId?: string; offset: number; by: number; bodyRows: number; contentRows: number; origin: { kind: string } }
+    if (s.requestId === PANE) void sample($, 'scroll', { offset: s.offset, by: s.by, bodyRows: s.bodyRows, contentRows: s.contentRows, origin: s.origin.kind, answered: moved })
+    return moved
+  })
+
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     // A reload starts from nothing: no timer of the old module, no drawing kept.
@@ -1140,10 +1196,15 @@ export const register: Register = (on, options) => {
     }
     await loadSnapshot($)
     try {
+      await promoteSession($)
       await sweepStore($)
     } catch {
       // A store that cannot be listed is swept next time.
     }
+    archiveTimer?.cancel()
+    resetArchiveScan()
+    void discardArchived($)
+    archiveTimer = $.clock.every(ARCHIVE_SCAN_MS, () => void discardArchived($))
     // What the panel's state says now: finished subagents and the open thread, for the hooks that mirror them.
     const kept = await read($, agents)
     finishedAgents.clear()
@@ -1779,6 +1840,7 @@ export const register: Register = (on, options) => {
       const lines =
         1 + (isEmpty ? 1 : 0) + (running.length > 0 ? 1 : 0) + (finished.length > 0 ? 1 : 0) + (planned.length > 0 ? 1 : 0) + (hidden > 0 ? 1 : 0)
       const gridH = headerHeight(title) + (lines + lite.size) * LINE_H + ((main ? 1 : 0) + full.size) * 66 + shownPlanned.length * 46
+      lastDrawn = { gridH, offset: e.props.scroll?.offset ?? -1, bodyRows: e.props.scroll?.bodyRows ?? -1, columns: e.props.bodyColumns }
       return (
         <Box flexDirection="column">
           {/* The grid sizes the pane; the content is placed over it, as an

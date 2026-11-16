@@ -6,6 +6,10 @@ Version bumps before 0.13.0 were not committed one by one, so entries before 0.1
 
 ## [Unreleased]
 
+### Changed
+- A session opened again moves to the front of the store's index, so a session in use is the last one dropped, however long ago it was first saved.
+- Copies of sessions the Claude desktop app has archived are discarded at once: at start and every five minutes the panel reads the app's session records (`claude-code-sessions/**/local_*.json`), only those changed since the last scan, and drops the copies of those marked archived. The open session's copy is never dropped. Without the desktop app, nothing changes.
+
 ## [1.3.0] - 2026-11-17
 
 ### Fixed
