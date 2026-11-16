@@ -48,6 +48,9 @@ export type AgentRun = {
   stepDone?: number
   stepTotal?: number
   stepNote?: string
+  /** On the one row that stands for subagents folded out of a large stored copy: how many, and how many failed. */
+  folded?: number
+  foldedFailed?: number
 }
 
 export type Panel = {

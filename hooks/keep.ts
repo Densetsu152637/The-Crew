@@ -1,109 +1,222 @@
-import type { SessionMessage } from 'claude-code'
+import type { AgentRun, AgentStatus, Flow, Panel } from '../types'
 
-import type { AgentRun, Flow, Panel } from '../types'
-
-// What the panel keeps between runs of one session. The engine holds a plugin's state only for
-// the process, so a session resumed later started with an empty panel; this is the copy that
-// outlives the process, stored under the session's id (`$.store`).
-
-/** The arguments of a tool call a thread line shows (see `toolLine`). */
-export const TOOL_ARG_KEYS = ['description', 'file_path', 'path', 'command', 'pattern', 'url', 'query'] as const
-
-export type KeptMessage = {
-  role: 'user' | 'assistant'
-  text: string
-  toolUses: { tool_use_id: string; tool: string; input: Record<string, unknown> }[]
-}
+// What the panel keeps between runs of one session. The engine holds a plugin's state only for the
+// process, so a session resumed later would start with an empty panel; this is the copy that outlives
+// the process, stored under the session's id (`$.store`).
+//
+// Only the telemetry the servers do not keep is stored: the rows (status, model, tokens, cost, times,
+// steps), the flow and the panel's settings. Subagent conversations stay with the engine, which fetches
+// them from the transcript when a thread is opened.
+//
+// The engine caps a plugin's whole store at 4 MiB of JSON. So the copy is sized, not counted: each
+// session's copy stays under SESSION_BYTES however many subagents it ran (the oldest finished ones are
+// folded into one row that carries their totals), and sessions are dropped, least recently saved first,
+// only once the copies together pass STORE_BYTES. A session with nothing on its panel is not stored.
 
 export type Snapshot = {
   /** Which idea of the panel wrote it; another one is let go, as a stored value of another shape. */
-  shape: 1
+  shape: 1 | 2
   savedAt: number
   flow: Flow | null
   agents: AgentRun[]
   root: AgentRun | null
   panel: Pick<Panel, 'isCompact' | 'isDoneCollapsed' | 'viewing'>
-  /** The conversations of the subagents, by agent id: the newest messages, as a thread draws them. */
-  threads: Record<string, KeptMessage[]>
 }
 
-/** Sessions kept; the least recently saved ones are dropped past it. */
-export const SESSIONS_KEPT = 10
-/** Characters of thread text kept for one subagent, and for one session in all. */
-export const AGENT_CHARS = 40_000
-export const SESSION_CHARS = 120_000
-const ARG_CHARS = 300
+/** One stored session in the index, most recently saved first: its id and its copy's size. */
+export type IndexEntry = { id: string; bytes: number }
+
+/** The most one session's copy may take, as JSON text. */
+export const SESSION_BYTES = 1024 * 1024
+/** The most the copies may take together, leaving room under the engine's 4 MiB for the index. */
+export const STORE_BYTES = 3 * 1024 * 1024
+/** Index entries kept at most, whatever their size, so the index itself stays small. */
+export const INDEX_MAX = 2000
+/** The id of the row that carries the totals of the folded subagents. */
+export const FOLD_ID = 'crew:folded'
 
 export const snapshotKey = (sessionId: string): string => `session:${sessionId}`
 export const INDEX_KEY = 'sessions'
 
-const clip = (s: string, max: number): string => (s.length > max ? s.slice(0, max) : s)
-
-/**
- * A conversation cut to what the thread draws: only messages with text or tool calls, the text
- * cut to `textMax`, a tool call down to the arguments its line shows, the newest messages first
- * to spend `cap` characters.
- */
-export function keepThread(messages: readonly SessionMessage[], textMax: number, cap: number): KeptMessage[] {
-  const out: KeptMessage[] = []
-  let budget = cap
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i]
-    if (!m || (!m.text && m.toolUses.length === 0)) continue
-    const text = clip(m.text, textMax)
-    const toolUses = m.toolUses.map(u => {
-      const input: Record<string, unknown> = {}
-      for (const k of TOOL_ARG_KEYS) {
-        const v = u.input?.[k]
-        if (typeof v === 'string') input[k] = clip(v, ARG_CHARS)
-      }
-      return { tool_use_id: u.tool_use_id, tool: u.tool, input }
-    })
-    const cost = text.length + toolUses.length * 120
-    if (cost > budget && out.length > 0) break
-    budget -= cost
-    out.push({ role: m.role, text, toolUses })
+/** The length of `value` as stored: JSON text, its non-ASCII characters at their UTF-8 width. */
+export function jsonBytes(value: unknown): number {
+  const s = JSON.stringify(value) ?? ''
+  let n = s.length
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i)
+    if (c >= 0x80) n += c >= 0x800 && (c < 0xd800 || c > 0xdfff) ? 2 : c < 0x800 ? 1 : 0
   }
-  return out.reverse()
+  return n
 }
 
-/** Threads kept for the agents still on the panel, newest agents first, within the session's budget. */
-export function keepThreads(kept: ReadonlyMap<string, KeptMessage[]>, agents: readonly AgentRun[]): Record<string, KeptMessage[]> {
-  const out: Record<string, KeptMessage[]> = {}
-  let budget = SESSION_CHARS
-  for (const a of [...agents].reverse()) {
-    const thread = a.agentId ? kept.get(a.agentId) : undefined
-    if (!a.agentId || !thread) continue
-    const cost = thread.reduce((n, m) => n + m.text.length + m.toolUses.length * 120, 0)
-    if (cost > budget) continue
-    budget -= cost
-    out[a.agentId] = thread
+/** Whether a panel holds anything worth keeping. */
+export const hasTelemetry = (s: Pick<Snapshot, 'flow' | 'agents' | 'root'>): boolean =>
+  s.agents.length > 0 || s.flow !== null || (s.root !== null && (s.root.inputTokens > 0 || s.root.costUsd > 0 || s.root.steps > 0))
+
+const elapsedOf = (a: AgentRun): number =>
+  a.endedAt !== undefined ? Math.max(0, a.endedAt - a.startedAt - (a.idleMs ?? 0)) : 0
+
+/** The rows `folded` summed into one: their tokens, cost, steps and time, and how many they were. */
+export function foldRows(folded: readonly AgentRun[]): AgentRun {
+  let count = 0
+  let input = 0
+  let output = 0
+  let cost = 0
+  let steps = 0
+  let time = 0
+  let failed = 0
+  let start = Infinity
+  for (const a of folded) {
+    const n = a.id === FOLD_ID ? a.folded ?? 0 : 1
+    count += n
+    input += a.inputTokens || 0
+    output += a.outputTokens || 0
+    cost += a.costUsd || 0
+    steps += a.steps || 0
+    time += elapsedOf(a)
+    failed += a.id === FOLD_ID ? a.foldedFailed ?? 0 : a.status === 'failed' ? 1 : 0
+    if (a.startedAt < start) start = a.startedAt
+  }
+  if (!Number.isFinite(start)) start = 0
+  return {
+    id: FOLD_ID,
+    type: 'folded',
+    role: 'other',
+    description: `${count} earlier subagents`,
+    model: '',
+    status: 'done',
+    startedAt: start,
+    endedAt: start + time,
+    contextTokens: 0,
+    contextMax: 0,
+    inputTokens: input,
+    outputTokens: output,
+    costUsd: cost,
+    steps,
+    round: 0,
+    folded: count,
+    foldedFailed: failed,
+  }
+}
+
+/**
+ * The rows as a copy keeps them within `budget` bytes: when they are too many, the oldest finished ones
+ * (and any earlier fold) become one row carrying their totals, so the panel's totals stay exact. Running
+ * rows are never folded, nor the newest ones.
+ */
+export function fitAgents(agents: readonly AgentRun[], budget: number): AgentRun[] {
+  if (jsonBytes(agents) <= budget) return [...agents]
+  const sizes = agents.map(a => jsonBytes(a) + 1)
+  const foldRowBytes = jsonBytes(foldRows(agents)) + 64
+  // Keep rows from the newest back while they fit; every finished row older than that is folded.
+  let room = budget - foldRowBytes - 2
+  const keep = new Array<boolean>(agents.length).fill(false)
+  agents.forEach((a, i) => {
+    if (a.status === 'running' && a.id !== FOLD_ID) {
+      keep[i] = true
+      room -= sizes[i] ?? 0
+    }
+  })
+  for (let i = agents.length - 1; i >= 0; i--) {
+    const size = sizes[i] ?? 0
+    if (keep[i] || agents[i]?.id === FOLD_ID) continue
+    if (size > room) break
+    keep[i] = true
+    room -= size
+  }
+  const folded = agents.filter((_, i) => !keep[i])
+  const kept = agents.filter((_, i) => keep[i])
+  return folded.length > 0 ? [foldRows(folded), ...kept] : kept
+}
+
+/** The snapshot within SESSION_BYTES. */
+export function fitSnapshot(s: Snapshot, budget = SESSION_BYTES): Snapshot {
+  const rest = jsonBytes({ ...s, agents: [] })
+  return { ...s, agents: fitAgents(s.agents, budget - rest) }
+}
+
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+const STATUSES = new Set<AgentStatus>(['running', 'done', 'failed', 'idle'])
+const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
+
+/** A stored row as the panel takes it back: undefined for one that is not a row; a bad count reads 0. */
+function reviveRow(v: unknown): AgentRun | undefined {
+  if (!isObject(v) || typeof v.id !== 'string' || typeof v.startedAt !== 'number') return undefined
+  const a = v as unknown as AgentRun
+  return {
+    ...a,
+    type: typeof a.type === 'string' ? a.type : 'other',
+    description: typeof a.description === 'string' ? a.description : '',
+    model: typeof a.model === 'string' ? a.model : '',
+    status: STATUSES.has(a.status) ? a.status : 'done',
+    contextTokens: num(a.contextTokens),
+    contextMax: num(a.contextMax),
+    inputTokens: num(a.inputTokens),
+    outputTokens: num(a.outputTokens),
+    costUsd: num(a.costUsd),
+    steps: num(a.steps),
+    round: num(a.round),
+  }
+}
+
+/**
+ * A stored snapshot as the panel resumes it: nothing runs in a process that has just started, so a run
+ * that was running is failed at the time it was saved, and the main session rests. A row that cannot be
+ * read is let go alone; undefined only for a value that is not a snapshot at all. Copies of shape 1 also
+ * held thread text, which is ignored.
+ */
+export function reviveSnapshot(stored: unknown): Snapshot | undefined {
+  if (!isObject(stored) || (stored.shape !== 1 && stored.shape !== 2) || !Array.isArray(stored.agents)) return undefined
+  const savedAt = num(stored.savedAt)
+  const rest = (a: AgentRun): AgentRun => (a.status === 'running' ? { ...a, status: 'failed', endedAt: savedAt } : a)
+  const agents = stored.agents.map(reviveRow).filter((a): a is AgentRun => a !== undefined).map(rest)
+  const root = reviveRow(stored.root)
+  const panel = isObject(stored.panel) ? stored.panel : {}
+  const flow = isObject(stored.flow) ? (stored.flow as unknown as Flow) : null
+  return {
+    shape: 2,
+    savedAt,
+    flow: flow ? { ...flow, running: 0 } : null,
+    agents,
+    root: root ? { ...root, status: root.status === 'running' ? 'idle' : root.status } : null,
+    panel: {
+      isCompact: panel.isCompact === true,
+      isDoneCollapsed: panel.isDoneCollapsed === true,
+      viewing: typeof panel.viewing === 'string' ? panel.viewing : '',
+    },
+  }
+}
+
+/** A stored index as entries; the shape-1 index (a list of ids) reads with unknown sizes. */
+export function readIndex(index: unknown): IndexEntry[] {
+  if (!Array.isArray(index)) return []
+  const seen = new Set<string>()
+  const out: IndexEntry[] = []
+  for (const x of index) {
+    const e = typeof x === 'string' ? { id: x, bytes: 0 } : isObject(x) && typeof x.id === 'string' ? { id: x.id, bytes: num(x.bytes) } : undefined
+    if (!e || seen.has(e.id)) continue
+    seen.add(e.id)
+    out.push(e)
   }
   return out
 }
 
-const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
-
 /**
- * A stored snapshot as the panel resumes it: nothing runs in a process that has just started, so a
- * run that was running is failed at the time it was saved, and the main session rests. Undefined
- * for a value that is not a snapshot of this shape.
+ * The index with `id` first at `bytes`, and the ids it no longer holds: the least recently saved go once
+ * the copies together pass `budget` or the index passes INDEX_MAX. The session being saved always stays.
  */
-export function reviveSnapshot(stored: unknown): Snapshot | undefined {
-  if (!isObject(stored) || stored.shape !== 1 || !Array.isArray(stored.agents) || !isObject(stored.panel) || !isObject(stored.threads)) return undefined
-  const s = stored as unknown as Snapshot
-  const rest = (a: AgentRun): AgentRun => (a.status === 'running' ? { ...a, status: 'failed', endedAt: s.savedAt } : a)
-  return {
-    ...s,
-    agents: s.agents.map(rest),
-    root: s.root ? { ...s.root, status: s.root.status === 'running' ? 'idle' : s.root.status } : null,
-    flow: s.flow ? { ...s.flow, running: 0 } : null,
+export function touchIndex(index: unknown, id: string, bytes: number, budget = STORE_BYTES): { index: IndexEntry[]; dropped: string[] } {
+  const all = [{ id, bytes }, ...readIndex(index).filter(e => e.id !== id)]
+  let total = 0
+  const kept: IndexEntry[] = []
+  const dropped: string[] = []
+  for (const [i, e] of all.entries()) {
+    if (i === 0 || (total + e.bytes <= budget && kept.length < INDEX_MAX)) {
+      kept.push(e)
+      total += e.bytes
+    } else {
+      dropped.push(e.id)
+    }
   }
-}
-
-/** The index with `id` first, and the ids it no longer holds. */
-export function touchIndex(index: unknown, id: string): { index: string[]; dropped: string[] } {
-  const ids = (Array.isArray(index) ? index : []).filter((x): x is string => typeof x === 'string' && x !== id)
-  const all = [id, ...ids]
-  return { index: all.slice(0, SESSIONS_KEPT), dropped: all.slice(SESSIONS_KEPT) }
+  return { index: kept, dropped }
 }

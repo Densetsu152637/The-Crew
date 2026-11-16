@@ -132,3 +132,54 @@ test('resume: a response or tool result stored after the turn completed leaves t
   await stored($, 'note', 'A note.')
   expect((await row($)).alt).toBe('Side work: Haiku 4.5, finished')
 })
+
+// The engine beneath the plugin, each spawn its own agent `a-<tool_use_id>`; `list` answers `$.agent.list()`.
+const engine = async ($: Engine, on: On, list: unknown[] = []) => {
+  mock.clock(on, { now: NOW })
+  mock.env(on, { LANG: 'en_US.UTF-8' })
+  on('settings.read', async () => ({ value: {} }) as never)
+  on('tool.register', (_$, e) => ({ value: { tool: `mcp__the-crew__${e.name}` } }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', async () => ({ cwd: '/repo' }) as never)
+  on('agent.spawn', (_$, e) => ({ model: 'claude-haiku-4-5', agentId: `a-${e.tool_use_id}` }))
+  on('agent.list', () => ({ value: list }) as never)
+  on('session.append', (_$, e, next) => next(e))
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+  on('turn.complete', () => ({ text: '' }) as never)
+  on('turn.step', async function* (_$, e) {
+    return { turnId: e.turnId, index: 0, answer: '', toolUses: [], stopReason: 'end_turn', usage: USAGE } as never
+  })
+  await $.session.start({ source: 'startup', cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+}
+
+test('resume: past 200 subagents every row stays, and the first one reused shows running', { timeoutMs: 60_000 } as never, async ($, on) => {
+  await engine($, on)
+  for (let i = 0; i < 250; i++) {
+    await $.agent.spawn({ ...SPAWN, tool_use_id: `t${i}`, description: `Task ${i}` } as never)
+    await $.turn.complete({ turnId: `s${i}`, agentId: `a-t${i}`, reason: 'answer', answer: 'ok', durationMs: 1, isAborted: false } as never)
+  }
+  await $.turn.start({ text: 'Back to the first task', turnId: 'again', agentId: 'a-t0' } as never)
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'desktop', component: 'Pane', requestId: 'crew-agents', props: pane })
+  const alts = (await ui.findAll({ type: 'Svg' })).map(el => String(el.props.alt))
+  expect(alts).toContain('Back to the first task: Haiku 4.5, running')
+  // Every agent still has its row, the oldest finished ones included.
+  // The Done header counts the finished rows: all but the one running again.
+  const labels = (await ui.findAll({ type: 'Button' })).map(b => String(b.props.label))
+  expect(labels.some(l => / · 249$/.test(l))).toBe(true)
+})
+
+test('resume: a subagent at work with no row gets one, running, named from the engine', async ($, on) => {
+  await engine($, on, [{ id: 'ghost', description: 'Ghost task', type: 'general-purpose', status: 'running' }])
+  const stream = ($.turn.step as (e: unknown) => AsyncIterable<unknown>)({ index: 0, messageCount: 1, turnId: 'g1', model: 'claude-haiku-4-5', agentId: 'ghost' })
+  for await (const _ of stream) void _
+  expect((await row($, 'Ghost task')).alt).toBe('Ghost task: Haiku 4.5, running')
+})
+
+test('resume: a message stored for a subagent with no row puts one up, running', async ($, on) => {
+  await engine($, on)
+  await $.session.append({ agentId: 'lost', door: 'delivery', message: { type: 'user', content: [{ type: 'text', text: 'Pick this back up' }] } } as never)
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'desktop', component: 'Pane', requestId: 'crew-agents', props: pane })
+  const alts = (await ui.findAll({ type: 'Svg' })).map(el => String(el.props.alt))
+  expect(alts.some(a => a.startsWith('Pick this back up') && a.endsWith('running'))).toBe(true)
+})

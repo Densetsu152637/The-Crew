@@ -6,6 +6,19 @@ Version bumps before 0.13.0 were not committed one by one, so entries before 0.1
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-17
+
+### Fixed
+- A busy session's panel no longer resets after a reload or resume. The store kept the ten most recently saved sessions whatever their size, so a run of short or empty sessions pushed a 200-subagent session's copy out. Copies are now kept by size: empty sessions are not stored, and older ones are dropped only once all copies together pass 3 MiB.
+- A subagent reused after more than 200 others ran now shows as running again. The panel kept only the newest 200 rows, so an older agent's row (and its tokens and cost in the totals) was dropped and its reuse had no row to show. Every row is kept now, and a subagent that turns up at work with no row (a turn, a model request, a resume or a message to it) gets one, named from the engine's agent list.
+- A save the store refuses no longer fails silently. The oldest other copies are dropped one at a time until it lands, and copies an index lost are swept at start.
+
+### Changed
+- The stored copy holds telemetry only (rows, tokens, cost, times, steps, the flow, the panel's settings). Subagent conversations are no longer copied; a thread is read from the session's transcript when opened.
+- A copy stays under 1 MiB at any scale: past that, the oldest finished subagents are folded into one `N earlier subagents` row that carries their tokens, cost, steps and failures, so the panel's totals stay exact. Tested at 20,000 subagents and 1.2T tokens.
+- A damaged row in a stored copy is skipped on its own instead of discarding the whole copy.
+- Token counts of a trillion or more read as T (`1.20T`).
+
 ## [1.2.0] - 2026-11-09
 
 ### Fixed

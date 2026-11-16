@@ -3,8 +3,8 @@ import type { EngineInterface, Register, SessionContextUsage, SessionMessage, Se
 
 import type { AgentRun, Flow, Panel, Phase, PlannedTask } from '../types'
 
-import { AGENT_CHARS, INDEX_KEY, keepThread, keepThreads, reviveSnapshot, snapshotKey, touchIndex } from './keep'
-import type { KeptMessage, Snapshot } from './keep'
+import { INDEX_KEY, fitSnapshot, hasTelemetry, jsonBytes, readIndex, reviveSnapshot, snapshotKey, touchIndex } from './keep'
+import type { Snapshot } from './keep'
 import { CLAY, COSTUMES, CRAB_BOX, CRAB_CSS, CRAB_SCALE, crab, crabCss, colorOf, TIER_COLOR } from './crabs'
 
 // the-crew: a fork of johnnyvizz's savvy-progress (MIT) that adds the main
@@ -433,7 +433,7 @@ const modelName = (id: string): string => {
 const norm = (s: string): string => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim()
 
 const fmtTokens = (n: number): string =>
-  n >= 1e9 ? `${(n / 1e9).toFixed(2)}B` : n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : `${Math.round(n)}`
+  n >= 1e12 ? `${(n / 1e12).toFixed(2)}T` : n >= 1e9 ? `${(n / 1e9).toFixed(2)}B` : n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : `${Math.round(n)}`
 
 // "12.34M in · 45k out".
 const fmtInOut = (t: { input: number; output: number }): string => `${fmtTokens(t.input)} ${tr().inWord} · ${fmtTokens(t.output)} ${tr().outWord}`
@@ -503,8 +503,14 @@ const totals = (list: AgentRun[], at: number) => {
   // `|| 0`: a row kept from before the split has neither count.
   const input = list.reduce((s, a) => s + (a.inputTokens || 0), 0)
   const output = list.reduce((s, a) => s + (a.outputTokens || 0), 0)
-  const start = Math.min(...list.map(a => a.startedAt))
-  const end = Math.max(...list.map(a => a.endedAt ?? Math.max(at, a.startedAt)))
+  // A loop, not a spread: a spread of tens of thousands of rows overflows the call stack.
+  let start = Infinity
+  let end = -Infinity
+  for (const a of list) {
+    if (a.startedAt < start) start = a.startedAt
+    const e = a.endedAt ?? Math.max(at, a.startedAt)
+    if (e > end) end = e
+  }
   return { cost, input, output, time: list.length ? end - start : 0 }
 }
 
@@ -955,36 +961,59 @@ const touchThread = (agentId: string | undefined): void => {
 }
 
 // --- keeping the panel between runs of a session. The engine holds a plugin's state for the process
-// only, so a session resumed later would start with an empty panel and lose its threads. A copy goes to
-// the plugin's store under the session's id, written a moment after the panel's state changes.
+// only, so a session resumed later would start with an empty panel. A copy of its telemetry (see keep.ts)
+// goes to the plugin's store under the session's id, written a moment after the panel's state changes.
+// Conversations are not copied: the engine reads them from the transcript.
 const SAVE_MS = 2000
 const SAVED_KEYS = new Set(['flow', 'agents', 'root', 'panel'])
 let sessionId = ''
-// Per agent: its conversation as last read, cut to what a thread draws, for when the engine no longer answers for it.
-const keptThreads = new Map<string, KeptMessage[]>()
 let saveTimer: Timer | undefined
+
+// Stores `snapshot` and the index. A refusal (the store full of older copies) drops the least recently
+// saved other sessions one at a time and tries again; the session's previous copy stays until a new one lands.
+async function writeSnapshot($: EngineInterface, snapshot: Snapshot): Promise<void> {
+  const bytes = jsonBytes(snapshot)
+  const { index, dropped } = touchIndex(await $.store.get(INDEX_KEY), sessionId, bytes)
+  for (const id of dropped) await $.store.delete(snapshotKey(id))
+  const others = index.slice(1)
+  for (;;) {
+    try {
+      await $.store.set(snapshotKey(sessionId), snapshot)
+      await $.store.set(INDEX_KEY, [index[0], ...others])
+      return
+    } catch (err) {
+      const oldest = others.pop()
+      if (!oldest) throw err
+      await $.store.delete(snapshotKey(oldest.id))
+    }
+  }
+}
+
+// Copies left behind by an index that lost them (a write cut short, an older version): let go, so they
+// never count against the store's cap unseen.
+async function sweepStore($: EngineInterface): Promise<void> {
+  const known = new Set(readIndex(await $.store.get(INDEX_KEY)).map(e => snapshotKey(e.id)))
+  for (const key of await $.store.keys()) if (key.startsWith('session:') && !known.has(key)) await $.store.delete(key)
+}
 
 async function saveSnapshot($: EngineInterface): Promise<void> {
   saveTimer = undefined
   if (!sessionId) return
   try {
-    const list = await read($, agents)
     const p: Panel = await read($, panel)
     const snapshot: Snapshot = {
-      shape: 1,
+      shape: 2,
       savedAt: await $.clock.now(),
       flow: await read($, flow),
-      agents: list,
+      agents: await read($, agents),
       root: await read($, root),
       panel: { isCompact: p.isCompact, isDoneCollapsed: p.isDoneCollapsed, viewing: p.viewing ?? '' },
-      threads: keepThreads(keptThreads, list),
     }
-    await $.store.set(snapshotKey(sessionId), snapshot)
-    const { index, dropped } = touchIndex(await $.store.get(INDEX_KEY), sessionId)
-    await $.store.set(INDEX_KEY, index)
-    for (const id of dropped) await $.store.delete(snapshotKey(id))
+    // A session with nothing on its panel takes no place in the store, so it never pushes a busy one out.
+    if (!hasTelemetry(snapshot)) return
+    await writeSnapshot($, fitSnapshot(snapshot))
   } catch {
-    // The store is a convenience: a refusal (too large, no store) leaves the panel as it is.
+    // The store is a convenience: a refusal leaves the panel, and the previous copy, as they are.
   }
 }
 
@@ -992,13 +1021,8 @@ const scheduleSave = ($: EngineInterface): void => {
   if (sessionId && !saveTimer) saveTimer = $.clock.after(SAVE_MS, () => void saveSnapshot($))
 }
 
-// A conversation as the thread draws it, kept in memory for the next save.
-const keepConversation = (agentId: string, found: SessionMessage[] | { deny: string }): void => {
-  if (Array.isArray(found) && found.length > 0) keptThreads.set(agentId, keepThread(found, THREAD_TEXT, AGENT_CHARS))
-}
-
-// The stored copy of this session, if any. Its threads are always loaded; its panel only into an empty one
-// (a hot reload keeps the live state, which is newer than the copy).
+// The stored copy of this session, if any, loaded only into an empty panel (a hot reload keeps the live
+// state, which is newer than the copy).
 async function loadSnapshot($: EngineInterface): Promise<void> {
   if (!sessionId) return
   let snapshot: Snapshot | undefined
@@ -1008,7 +1032,6 @@ async function loadSnapshot($: EngineInterface): Promise<void> {
     return
   }
   if (!snapshot) return
-  for (const [id, thread] of Object.entries(snapshot.threads)) keptThreads.set(id, thread)
   const isEmpty = (await read($, agents)).length === 0 && (await read($, flow)) === null && (await read($, root)) === null
   if (!isEmpty) return
   await update($, flow, () => snapshot.flow)
@@ -1064,6 +1087,40 @@ const bandClock = async ($: EngineInterface): Promise<number> => {
   }
 }
 
+// A subagent at work with no row (dropped by an older version, folded out of a large stored copy, or
+// spawned before the panel loaded) gets one again, running, so its reuse shows. Its description and type
+// come from the engine's agent list when it answers. True when a row was added.
+async function adoptAgent($: EngineInterface, agentId: string, at: number, prompt?: string): Promise<boolean> {
+  if ((await read($, agents)).some(a => a.agentId === agentId)) return false
+  let info: { description?: string; type?: string; name?: string } | undefined
+  try {
+    info = (await $.agent.list()).find(l => l.id === agentId)
+  } catch {
+    // No agent list from this host: the row is named from its task.
+  }
+  const type = info?.type || 'general-purpose'
+  const run: AgentRun = {
+    id: agentId,
+    agentId,
+    type,
+    role: roleOfSpawn(type, prompt ?? ''),
+    description: info?.description || info?.name || taskTitle({ prompt }) || agentId,
+    model: '',
+    status: 'running',
+    startedAt: at,
+    contextTokens: 0,
+    contextMax: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    costUsd: 0,
+    steps: 0,
+    round: 1,
+  }
+  await update($, agents, list => (list.some(a => a.agentId === agentId) ? list : [...list, run]))
+  finishedAgents.delete(agentId)
+  return true
+}
+
 export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
@@ -1076,13 +1133,17 @@ export const register: Register = (on, options) => {
     band = undefined
     saveTimer?.cancel()
     saveTimer = undefined
-    keptThreads.clear()
     try {
       sessionId = await $.session.id()
     } catch {
       sessionId = ''
     }
     await loadSnapshot($)
+    try {
+      await sweepStore($)
+    } catch {
+      // A store that cannot be listed is swept next time.
+    }
     // What the panel's state says now: finished subagents and the open thread, for the hooks that mirror them.
     const kept = await read($, agents)
     finishedAgents.clear()
@@ -1277,6 +1338,14 @@ export const register: Register = (on, options) => {
       }
       return started
     }
+    if (resumed) {
+      const started = await next(e)
+      if (started.deny === undefined) {
+        await adoptAgent($, resumed, await $.clock.now(), e.prompt)
+        await syncTicker($)
+      }
+      return started
+    }
 
     const isUnbriefed = e.subagentType.startsWith('savvy-') && !e.prompt.includes(STEP_TOOL)
     const started = await next(isUnbriefed ? { ...e, prompt: e.prompt + STEP_BRIEF } : e)
@@ -1302,7 +1371,8 @@ export const register: Register = (on, options) => {
         steps: 0,
         round,
       }
-      return [...list.filter(a => a.id !== run.id), run].slice(-200)
+      // Every row is kept: a cap dropped the oldest ones, their totals with them, and a reused one never showed running.
+      return [...list.filter(a => a.id !== run.id), run]
     })
     await update($, now, () => at)
     await syncTicker($)
@@ -1323,6 +1393,9 @@ export const register: Register = (on, options) => {
     const at = await $.clock.now()
     if (agentId === undefined) {
       await update($, root, (prev): AgentRun => ({ ...(prev ?? newRoot(at)), status: 'running' }))
+      await update($, now, () => at)
+      await syncTicker($)
+    } else if (await adoptAgent($, agentId, at, e.text)) {
       await update($, now, () => at)
       await syncTicker($)
     } else if ((await read($, agents)).some(a => a.agentId === agentId && a.status !== 'running')) {
@@ -1363,6 +1436,7 @@ export const register: Register = (on, options) => {
     }
 
     const model = usage.model || e.model
+    await adoptAgent($, agentId, await $.clock.now())
     await update($, agents, list =>
       list.map((a): AgentRun =>
         a.agentId !== agentId
@@ -1394,14 +1468,16 @@ export const register: Register = (on, options) => {
     const stored = await next(e)
     const agentId = e.agentId
     if (!agentId || stored.deny !== undefined) return stored
-    if (finishedAgents.has(agentId) && REUSE_DOORS.has(e.door)) {
+    // A new input for an agent that is finished, or that has no row: it is at work again. Only these doors
+    // read the state; every other row is let go without one.
+    if (REUSE_DOORS.has(e.door) && (finishedAgents.has(agentId) || !(await read($, agents)).some(a => a.agentId === agentId && a.status === 'running'))) {
       finishedAgents.delete(agentId)
       const at = await $.clock.now()
       // The row carries the new task's brief.
       const content = e.message.content as unknown
       const text = Array.isArray(content) ? content.map(b => (b as { text?: unknown }).text).find(t => typeof t === 'string') : content
       const prompt = typeof text === 'string' ? text : undefined
-      await update($, agents, list => renew(list, agentId, at, { prompt }))
+      if (!(await adoptAgent($, agentId, at, prompt))) await update($, agents, list => renew(list, agentId, at, { prompt }))
       await update($, now, () => at)
       await syncTicker($)
     }
@@ -1608,11 +1684,7 @@ export const register: Register = (on, options) => {
         const version = threadVersion.get(viewing.agentId) ?? 0
         let cached = threads.get(viewing.agentId)
         if (!cached || cached.version !== version) {
-          let found = await $.session.messages({ agentId: viewing.agentId })
-          // The engine may no longer hold the conversation (a session resumed in a new process): draw the kept copy.
-          const copy = keptThreads.get(viewing.agentId)
-          if (copy && (!Array.isArray(found) || found.length === 0)) found = copy as SessionMessage[]
-          else keepConversation(viewing.agentId, found)
+          const found = await $.session.messages({ agentId: viewing.agentId })
           cached = { version, found }
           threads.set(viewing.agentId, cached)
         }
