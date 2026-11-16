@@ -39,7 +39,13 @@ const process = async ($: Engine, on: On, sessionId: string, records: Record<str
   mock.env(on, { LANG: 'en_US.UTF-8', LOCALAPPDATA: String.raw`C:\Users\me\AppData\Local` })
   const files = new Map(Object.entries(records).map(([name, v]) => [`${SESSIONS}/acct/org/${name}`, { text: JSON.stringify(v), mtime: 1 }]))
   const reads: string[] = []
-  const norm = (p: string) => p.replace(/\\/g, '/')
+  // The engine hands paths in its platform's form: backslashes on Windows, and elsewhere a `C:/` path is not
+  // absolute, so it arrives under the working directory. Compare from the user folder on.
+  const norm = (p: string) => {
+    const s = p.replace(/\\/g, '/')
+    const at = s.indexOf('Users/me')
+    return at < 0 ? s : `C:/${s.slice(at)}`
+  }
   on('fs.list', (_$, e) => {
     const dir = norm(e.path)
     const kids = new Map<string, 'file' | 'dir'>()
