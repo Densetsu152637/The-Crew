@@ -257,3 +257,28 @@ test('working: an interrupted subagent stays finished while the list lags, and i
   await $.tool.call({ tool: 'mcp__the-crew__step', agentId: 'a1', done: 0, total: 2 } as never)
   expect(await panel($)).toEqual({ rows: ['Stopped work: running'], running: 1 })
 })
+
+test("working: a tool call left over from an earlier turn, answering late, does not release the next turn's call", async ($, on) => {
+  const answers: ((v: unknown) => void)[] = []
+  on('tool.call', { tool: 'Bash' }, () => new Promise(resolve => answers.push(resolve)) as never)
+  const { clock, spawn, status, complete } = await engine($, on)
+  await spawn(1, 'Two turns')
+  // Turn N leaves its call unanswered and ends.
+  const stale = $.tool.call({ tool: 'Bash', agentId: 'a1', command: 'first' } as never)
+  await clock.settle()
+  await complete('a1')
+  // Turn N+1 waits on a call of its own; the list calls the agent idle meanwhile.
+  await $.turn.start({ text: 'Again', turnId: 'n2', agentId: 'a1' } as never)
+  const held = $.tool.call({ tool: 'Bash', agentId: 'a1', command: 'second' } as never)
+  await clock.settle()
+  status('a1', 'idle')
+  // Turn N's call answers now: turn N+1's call still holds the row.
+  answers[0]?.({ result: 'late' })
+  await stale
+  await clock.advance(30_000)
+  expect(await panel($)).toEqual({ rows: ['Again: running'], running: 1 })
+  answers[1]?.({ result: 'ok' })
+  await held
+  await clock.advance(5000)
+  expect(await panel($)).toEqual({ rows: ['Again: finished'], running: 0 })
+})

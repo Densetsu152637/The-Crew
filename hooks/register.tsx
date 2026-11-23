@@ -991,6 +991,13 @@ const heard = (agentId: string, at: number): void => {
   heardAt.set(agentId, at)
   abortedAgents.delete(agentId)
 }
+// An agent whose row was let go: nothing kept for it stays behind, however long the session runs. (The size cap
+// folds rows only in the stored copy, which is loaded after `session.start` has cleared all of these.)
+const forget = (agentId: string): void => {
+  heardAt.delete(agentId)
+  inTool.delete(agentId)
+  abortedAgents.delete(agentId)
+}
 
 async function openThread($: EngineInterface, id: string, agentId: string, refresh: () => void): Promise<void> {
   viewingAgent = agentId
@@ -1197,7 +1204,11 @@ async function reconcileHost($: EngineInterface): Promise<void> {
   try {
     do {
       isReconcileDue = false
-      await reconcilePass($)
+      try {
+        await reconcilePass($)
+      } catch {
+        // A refused read or write leaves the rows as they were; a pass asked for meanwhile still runs.
+      }
     } while (isReconcileDue)
   } finally {
     isReconciling = false
@@ -1498,8 +1509,11 @@ export const register: Register = (on, options) => {
     const input = e as unknown as ProgressInput
     const prev = await read($, flow)
     if (isNewFlow(prev, input) && input.title !== undefined) {
-      // A new flow starts with a clean list; agents still running stay.
-      await update($, agents, list => list.filter(a => a.status === 'running'))
+      // A new flow starts with a clean list; agents still running stay. What was kept for the rows let go goes too.
+      const before = await read($, agents)
+      const kept = await update($, agents, list => list.filter(a => a.status === 'running'))
+      const left = new Set(kept.map(a => a.agentId))
+      for (const a of before) if (a.agentId && !left.has(a.agentId)) forget(a.agentId)
       await syncTicker($)
     }
     const next = await update($, flow, p => merge(p, input))
