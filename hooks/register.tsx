@@ -506,20 +506,32 @@ const HOST_GRACE_MS = 2000
 // an Agent call). Idle between turns, or ended, is not.
 const isHostWorking = (s: HostStatus): boolean => s === 'pending' || s === 'running' || s === 'waiting'
 const hostEnd = (s: HostStatus): 'done' | 'failed' => (s === 'failed' || s === 'killed' ? 'failed' : 'done')
+// A teammate's status in a terminal pane of its own is the word it last wrote in its team's roster, which a pane
+// that closed or died leaves standing: the list is no word on it, and its row follows its events alone.
+const isTeammate = (h: AgentInfo): boolean => h.teammateId !== undefined || h.type === 'teammate'
+// The agents of the list whose status the rows follow: every one but a teammate.
+const trusted = (host: readonly AgentInfo[]): AgentInfo[] => host.filter(h => !isTeammate(h))
 
 // The rows as the engine's list has them. A finished row whose loop is at work there is running again, moved
-// first under Running; a running row whose loop has ended or gone idle is finished. A row the list does not
-// name keeps what its events said, and so does one `isHeld` names (a tool call of its own in flight, an event
-// heard within HOST_GRACE_MS). The same list comes back when nothing changed.
-const settle = (list: AgentRun[], host: readonly AgentInfo[], at: number, isHeld: (agentId: string) => boolean): AgentRun[] => {
-  const byId = new Map(host.map(h => [h.id, h]))
+// first under Running, unless `isWakeable` refuses it (a turn that ended by interruption, which the list may
+// lag); a running row whose loop has ended or gone idle is finished. A row the list does not name, or names as
+// a teammate, keeps what its events said, and so does one `isHeld` names (a tool call of its own in flight, an
+// event heard within HOST_GRACE_MS). The same list comes back when nothing changed.
+const settle = (
+  list: AgentRun[],
+  host: readonly AgentInfo[],
+  at: number,
+  isHeld: (agentId: string) => boolean,
+  isWakeable: (agentId: string) => boolean = () => true,
+): AgentRun[] => {
+  const byId = new Map(trusted(host).map(h => [h.id, h]))
   const woken: string[] = []
   let isChanged = false
   const ended = list.map((a): AgentRun => {
     const h = a.agentId ? byId.get(a.agentId) : undefined
     if (!h || !a.agentId) return a
     if (isHostWorking(h.status)) {
-      if (a.status !== 'running' && at - (a.endedAt ?? 0) >= HOST_GRACE_MS) woken.push(a.agentId)
+      if (a.status !== 'running' && at - (a.endedAt ?? 0) >= HOST_GRACE_MS && isWakeable(a.agentId)) woken.push(a.agentId)
       return a
     }
     if (a.status !== 'running' || isHeld(a.agentId)) return a
@@ -967,9 +979,18 @@ const REUSE_DOORS = new Set(['prompt', 'delivery'])
 // Per subagent: when an event last showed it at work, and how many of its tool calls are in flight (a
 // permission prompt and a long command included). Either holds its row running against the engine's list.
 const heardAt = new Map<string, number>()
-const inTool = new Map<string, number>()
+// Calls are kept one by one, so a call its turn left behind (dropped at the turn's end) cannot take a later one's place.
+const inTool = new Map<string, Set<object>>()
 const isHeldAt = (at: number) => (agentId: string): boolean =>
-  (inTool.get(agentId) ?? 0) > 0 || at - (heardAt.get(agentId) ?? -Infinity) < HOST_GRACE_MS
+  (inTool.get(agentId)?.size ?? 0) > 0 || at - (heardAt.get(agentId) ?? -Infinity) < HOST_GRACE_MS
+// Agents whose last turn ended by interruption: the list may still call them at work for a while, so only an
+// event of their own (a turn, a step, a tool call, a message or a resume) wakes them, not the list.
+const abortedAgents = new Set<string>()
+// An event showed the agent at work.
+const heard = (agentId: string, at: number): void => {
+  heardAt.set(agentId, at)
+  abortedAgents.delete(agentId)
+}
 
 async function openThread($: EngineInterface, id: string, agentId: string, refresh: () => void): Promise<void> {
   viewingAgent = agentId
@@ -1163,34 +1184,48 @@ async function hostAgents($: EngineInterface): Promise<AgentInfo[] | undefined> 
 }
 
 // The rows settled against the engine's list (see `settle`), and a row for each agent the list has at work
-// that has none. Nothing is written when nothing changed.
+// that has none (a teammate never: its status may be stale). Nothing is written when nothing changed. A read
+// asked for while one is under way is not dropped: one more pass runs after it, with the list as it is then.
 let isReconciling = false
+let isReconcileDue = false
 async function reconcileHost($: EngineInterface): Promise<void> {
-  if (isReconciling) return
+  if (isReconciling) {
+    isReconcileDue = true
+    return
+  }
   isReconciling = true
   try {
-    const host = await hostAgents($)
-    if (!host) return
-    const at = await $.clock.now()
-    const isHeld = isHeldAt(at)
-    const apply = (list: AgentRun[]): AgentRun[] => {
-      const settled = settle(list, host, at, isHeld)
-      const missing = host.filter(h => isHostWorking(h.status) && !list.some(a => a.agentId === h.id))
-      return missing.length ? [...settled, ...missing.map(h => newRun(h.id, at, h))] : settled
-    }
-    const list = await read($, agents)
-    if (apply(list) === list) return
-    const next = await update($, agents, apply)
-    for (const a of next) {
-      if (!a.agentId) continue
-      if (a.status === 'running') finishedAgents.delete(a.agentId)
-      else finishedAgents.add(a.agentId)
-    }
-    await update($, now, () => at)
-    await syncTicker($)
+    do {
+      isReconcileDue = false
+      await reconcilePass($)
+    } while (isReconcileDue)
   } finally {
     isReconciling = false
+    isReconcileDue = false
   }
+}
+
+async function reconcilePass($: EngineInterface): Promise<void> {
+  const host = await hostAgents($)
+  if (!host) return
+  const at = await $.clock.now()
+  const isHeld = isHeldAt(at)
+  const isWakeable = (agentId: string) => !abortedAgents.has(agentId)
+  const apply = (list: AgentRun[]): AgentRun[] => {
+    const settled = settle(list, host, at, isHeld, isWakeable)
+    const missing = trusted(host).filter(h => isHostWorking(h.status) && !list.some(a => a.agentId === h.id))
+    return missing.length ? [...settled, ...missing.map(h => newRun(h.id, at, h))] : settled
+  }
+  const list = await read($, agents)
+  if (apply(list) === list) return
+  const next = await update($, agents, apply)
+  for (const a of next) {
+    if (!a.agentId) continue
+    if (a.status === 'running') finishedAgents.delete(a.agentId)
+    else finishedAgents.add(a.agentId)
+  }
+  await update($, now, () => at)
+  await syncTicker($)
 }
 
 // A subagent's turn ended: the list is read again a moment later, as it may not have caught up yet (a loop
@@ -1250,7 +1285,7 @@ async function adoptAgent($: EngineInterface, agentId: string, at: number, promp
   const run = newRun(agentId, at, info, prompt)
   await update($, agents, list => (list.some(a => a.agentId === agentId) ? list : [...list, run]))
   finishedAgents.delete(agentId)
-  heardAt.set(agentId, at)
+  heard(agentId, at)
   return true
 }
 
@@ -1308,6 +1343,8 @@ export const register: Register = (on, options) => {
     recheckTimer?.cancel()
     recheckTimer = undefined
     heardAt.clear()
+    inTool.clear()
+    abortedAgents.clear()
     memo.reset()
     threads.clear()
     paneSurfaces.clear()
@@ -1433,21 +1470,24 @@ export const register: Register = (on, options) => {
   on('tool.call', async ($, e, next) => {
     const agentId = e.agentId
     if (!agentId) return next(e)
-    inTool.set(agentId, (inTool.get(agentId) ?? 0) + 1)
+    const call = {}
+    const calls = inTool.get(agentId) ?? new Set<object>()
+    calls.add(call)
+    inTool.set(agentId, calls)
     try {
       if (finishedAgents.has(agentId)) {
         finishedAgents.delete(agentId)
         const at = await $.clock.now()
-        heardAt.set(agentId, at)
+        heard(agentId, at)
         if (!(await adoptAgent($, agentId, at))) await update($, agents, list => renew(list, agentId, at))
         await update($, now, () => at)
         await syncTicker($)
       }
       return await next(e)
     } finally {
-      const left = (inTool.get(agentId) ?? 1) - 1
-      if (left > 0) inTool.set(agentId, left)
-      else inTool.delete(agentId)
+      const left = inTool.get(agentId)
+      left?.delete(call)
+      if (left?.size === 0) inTool.delete(agentId)
     }
   })
 
@@ -1518,7 +1558,7 @@ export const register: Register = (on, options) => {
     if (!row || row.status === 'running') return next(e)
     const at = await $.clock.now()
     finishedAgents.delete(row.agentId as string)
-    heardAt.set(row.agentId as string, at)
+    heard(row.agentId as string, at)
     await update($, agents, rows => renew(rows, row.agentId as string, at, { summary: input.summary, prompt: input.message }))
     await update($, now, () => at)
     await syncTicker($)
@@ -1539,7 +1579,7 @@ export const register: Register = (on, options) => {
     if (resumed && before) {
       const at = await $.clock.now()
       finishedAgents.delete(resumed)
-      heardAt.set(resumed, at)
+      heard(resumed, at)
       await update($, agents, list => renew(list, resumed, at, { prompt: e.prompt }))
       await update($, now, () => at)
       await syncTicker($)
@@ -1588,7 +1628,7 @@ export const register: Register = (on, options) => {
     })
     if (started.agentId) {
       finishedAgents.delete(started.agentId)
-      heardAt.set(started.agentId, at)
+      heard(started.agentId, at)
     }
     await update($, now, () => at)
     await syncTicker($)
@@ -1607,7 +1647,7 @@ export const register: Register = (on, options) => {
     const started = await next(e)
     const agentId = e.agentId
     const at = await $.clock.now()
-    if (agentId !== undefined) heardAt.set(agentId, at)
+    if (agentId !== undefined) heard(agentId, at)
     if (agentId === undefined) {
       await update($, root, (prev): AgentRun => ({ ...(prev ?? newRoot(at)), status: 'running' }))
       await update($, now, () => at)
@@ -1654,7 +1694,7 @@ export const register: Register = (on, options) => {
 
     const model = usage.model || e.model
     const at = await $.clock.now()
-    heardAt.set(agentId, at)
+    heard(agentId, at)
     await adoptAgent($, agentId, at)
     // A step of a finished agent whose turn's start went unheard: running again, first under Running, as a
     // turn's start would have put it.
@@ -1698,7 +1738,7 @@ export const register: Register = (on, options) => {
     if (REUSE_DOORS.has(e.door) && (finishedAgents.has(agentId) || !(await read($, agents)).some(a => a.agentId === agentId && a.status === 'running'))) {
       finishedAgents.delete(agentId)
       const at = await $.clock.now()
-      heardAt.set(agentId, at)
+      heard(agentId, at)
       // The row carries the new task's brief.
       const content = e.message.content as unknown
       const text = Array.isArray(content) ? content.map(b => (b as { text?: unknown }).text).find(t => typeof t === 'string') : content
@@ -1721,10 +1761,15 @@ export const register: Register = (on, options) => {
       touchThread(agentId)
       // A turn ended, but the engine may hold the agent's loop on work it owns (a background command, an Agent
       // call, a plan's approval): it is still at work, and its row stays running until the list says it ended.
+      // Not for a teammate, whose listed status may be stale, nor after an interruption.
       const host = e.reason === 'aborted' ? undefined : (await hostAgents($))?.find(h => h.id === agentId)
-      const isHeld = host?.status === 'waiting'
-      if (isHeld) heardAt.set(agentId, at)
+      const isHeld = host !== undefined && !isTeammate(host) && host.status === 'waiting'
+      // The turn is over: a tool call it left unanswered (a permission prompt cancelled) no longer holds the row.
+      inTool.delete(agentId)
+      if (isHeld) heard(agentId, at)
       else finishedAgents.add(agentId)
+      // An interrupted run is woken by an event of its own, not by a list that may not have caught up.
+      if (e.reason === 'aborted') abortedAgents.add(agentId)
       // Its conversation is read only while its thread is open (the render keeps that copy); a row follows its events alone.
       await update($, agents, list =>
         list.map((a): AgentRun => {

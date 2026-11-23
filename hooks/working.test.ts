@@ -20,12 +20,14 @@ const SPAWN = {
   fork: false,
 }
 
-type Listed = { id: string; description: string; type: string; status: string }
+type Listed = { id: string; description: string; type: string; status: string; teammateId?: string }
 
 // The engine beneath the plugin. Each spawn `tN` starts agent `aN`; `host` is what `$.agent.list()` answers,
-// changed by the tests as the engine's own view moves.
-const engine = async ($: Engine, on: On) => {
-  const host: Listed[] = []
+// changed by the tests as the engine's own view moves. `gate.wait`, when set, holds each list read (with the
+// list as it stood when asked) until it settles; `reads` counts the reads.
+const engine = async ($: Engine, on: On, initial: Listed[] = []) => {
+  const host: Listed[] = [...initial]
+  const gate: { wait?: Promise<void>; reads: number } = { reads: 0 }
   const clock = mock.clock(on, { now: NOW })
   mock.env(on, { LANG: 'en_US.UTF-8' })
   on('settings.read', async () => ({ value: {} }) as never)
@@ -34,7 +36,12 @@ const engine = async ($: Engine, on: On) => {
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.start', async () => ({ cwd: '/repo' }) as never)
   on('agent.spawn', (_$, e) => ({ model: 'claude-haiku-4-5', agentId: e.tool_use_id.replace(/^t/, 'a') }))
-  on('agent.list', () => ({ value: host.map(h => ({ ...h })) }) as never)
+  on('agent.list', async () => {
+    gate.reads++
+    const listed = host.map(h => ({ ...h }))
+    if (gate.wait) await gate.wait
+    return { value: listed } as never
+  })
   on('session.append', (_$, e, next) => next(e))
   on('turn.start', (_$, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }) as never)
@@ -53,7 +60,7 @@ const engine = async ($: Engine, on: On) => {
   }
   const complete = (id: string, reason = 'answer') =>
     $.turn.complete({ turnId: `end-${id}`, agentId: id, reason, answer: 'ok', durationMs: 1, isAborted: reason === 'aborted' } as never)
-  return { clock, host, spawn, status, complete }
+  return { clock, host, gate, spawn, status, complete }
 }
 
 // The panel's subagent rows top to bottom as the desktop draws them (`title: state`), and the Running count.
@@ -184,4 +191,69 @@ test('order: a finished subagent at work again goes first under Running, however
   status('a1', 'running')
   await clock.advance(5000)
   expect(await panel($)).toEqual({ rows: ['Alpha: running', 'Beta: running', 'Gamma: running'], running: 3 })
+})
+
+test("working: a teammate's listed status puts up no row and keeps nothing polling; its row follows its events", async ($, on) => {
+  // A teammate in a terminal pane that died: the roster's last word, `running`, stands.
+  const stale = { id: 'tm1', description: 'Scout the docs', type: 'teammate', status: 'running', teammateId: 'scout@crew' }
+  const { clock, gate, complete } = await engine($, on, [stale])
+  expect(await panel($)).toEqual({ rows: [], running: 0 })
+  const reads = gate.reads
+  await clock.advance(60_000)
+  expect(gate.reads).toBe(reads)
+
+  // Its own events put its row up and end it; the stale `running` neither holds nor wakes it.
+  await $.turn.start({ text: 'Scout the docs', turnId: 'tm-1', agentId: 'tm1' } as never)
+  expect((await panel($)).running).toBe(1)
+  await complete('tm1')
+  await clock.advance(30_000)
+  expect(await panel($)).toEqual({ rows: ['Scout the docs: finished'], running: 0 })
+})
+
+test('working: a list read asked for while one is under way runs after it, not dropped', async ($, on) => {
+  const { clock, gate, spawn, status } = await engine($, on)
+  await spawn(1, 'Racing')
+  let release: () => void = () => {}
+  gate.wait = new Promise<void>(resolve => (release = resolve))
+  // The poll reads the list while the agent still runs, and its answer is held.
+  await clock.advance(5000)
+  // The agent ends, and the next poll comes while the first is still under way.
+  status('a1', 'completed')
+  await clock.advance(5000)
+  gate.wait = undefined
+  release()
+  for (let i = 0; i < 10; i++) await clock.settle()
+  expect(await panel($)).toEqual({ rows: ['Racing: finished'], running: 0 })
+})
+
+test("working: a tool call its turn left unanswered does not hold the row once the turn ended", async ($, on) => {
+  // A permission prompt that is cancelled: the call never answers.
+  on('tool.call', { tool: 'Write' }, () => new Promise(() => {}) as never)
+  const { clock, spawn, status, complete } = await engine($, on)
+  await spawn(1, 'Edit files')
+  void $.tool.call({ tool: 'Write', agentId: 'a1', file_path: '/repo/x' } as never)
+  await clock.settle()
+  // The engine holds the loop on its background work after the turn, then ends it.
+  status('a1', 'waiting')
+  await complete('a1')
+  expect((await panel($)).running).toBe(1)
+  status('a1', 'completed')
+  await clock.advance(5000)
+  expect(await panel($)).toEqual({ rows: ['Edit files: finished'], running: 0 })
+})
+
+test('working: an interrupted subagent stays finished while the list lags, and its own event wakes it', async ($, on) => {
+  const { clock, spawn, status, complete } = await engine($, on)
+  await spawn(1, 'Stopped work')
+  // The list still says running for 3 s after the interruption.
+  await complete('a1', 'aborted')
+  await clock.advance(3000)
+  expect(await panel($)).toEqual({ rows: ['Stopped work: finished'], running: 0 })
+  status('a1', 'completed')
+  await clock.advance(5000)
+  expect((await panel($)).running).toBe(0)
+  // A call of its own is at work again.
+  status('a1', 'running')
+  await $.tool.call({ tool: 'mcp__the-crew__step', agentId: 'a1', done: 0, total: 2 } as never)
+  expect(await panel($)).toEqual({ rows: ['Stopped work: running'], running: 1 })
 })

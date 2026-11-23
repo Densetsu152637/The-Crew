@@ -13,6 +13,10 @@ Version bumps before 0.13.0 were not committed one by one, so entries before 0.1
   - A subagent the engine stopped without a turn end (`killed`, `failed`) is finished instead of running for good, and one the engine has at work with no row gets one.
   - The band's `N running` counts the subagents at work, as the panel's Running section does. It counted only `savvy-*` Agent calls in flight, and a background call answers as soon as its agent starts, so it read 0 while agents worked.
   - A loop the engine's list does not name (its own forks for compaction or memory) no longer gets a row of its own.
+  - A teammate's listed status is not followed: in a terminal pane of its own it is the last word it wrote in its team's roster, which a closed or dead pane leaves standing as `running`. It no longer puts up a row, wakes one, holds one running or keeps the list polled; a teammate's row follows its own events.
+  - A read of the list asked for while one is under way runs once more after it instead of being dropped, so a change between the two is not missed until the next poll.
+  - A tool call its turn left unanswered (a cancelled permission prompt) no longer holds the agent's row running after the turn ended.
+  - A subagent whose turn was interrupted is not put back to running by a list that has not caught up yet; an event of its own (a turn, a step, a tool call, a message or a resume) wakes it.
 - A subagent at work again goes first under Running however it is noticed. A model request or a tool call of a finished agent whose turn's start went unheard put it back to running where it stood, at the bottom of Running, under its old title; it is now renewed and moved first, as a resume or a message does. The collapsed strip orders its crabs the same way.
 
 ### Changed
