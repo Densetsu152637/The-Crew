@@ -18,8 +18,8 @@ const SPAWN = {
   fork: false,
 }
 
-// The engine beneath the plugin: subagent `a1` has run one turn and finished.
-const finished = async ($: Engine, on: On) => {
+// The engine beneath the plugin: subagent `a1` has run one turn and finished; `during` runs inside that turn.
+const finished = async ($: Engine, on: On, during?: () => Promise<unknown>) => {
   const clock = mock.clock(on, { now: NOW })
   mock.env(on, { LANG: 'en_US.UTF-8' })
   on('settings.read', async () => ({ value: {} }) as never)
@@ -37,6 +37,7 @@ const finished = async ($: Engine, on: On) => {
   await $.agent.spawn(SPAWN as never)
   const stream = ($.turn.step as (e: unknown) => AsyncIterable<unknown>)({ index: 0, messageCount: 1, turnId: 's1', model: 'claude-haiku-4-5', agentId: 'a1' })
   for await (const _ of stream) void _
+  await during?.()
   await $.turn.complete({ turnId: 's1', agentId: 'a1', reason: 'answer', answer: 'ok', durationMs: 1, isAborted: false } as never)
   return clock
 }
@@ -81,8 +82,7 @@ test('resume: SendMessage to a finished subagent renews its row with the summary
     during = (await row($, 'Check the edge cases')).alt
     return { result: { success: true } } as never
   })
-  await finished($, on)
-  await $.tool.call({ tool: 'mcp__the-crew__step', agentId: 'a1', done: 2, total: 2, note: 'old task' } as never)
+  await finished($, on, () => $.tool.call({ tool: 'mcp__the-crew__step', agentId: 'a1', done: 2, total: 2, note: 'old task' } as never))
   await $.tool.call({ tool: 'SendMessage', to: 'a1', summary: 'Check the edge cases', message: 'Role: leaf; Profile: debugger\nLook again.' } as never)
   expect(during).toBe('Check the edge cases: Haiku 4.5, running')
   const after = await row($, 'Check the edge cases')
@@ -119,6 +119,8 @@ test("resume: a prompt or delivery stored in a finished subagent's conversation 
   const clock = await finished($, on)
   await clock.advance(60_000)
   expect((await row($)).alt).toBe('Side work: Haiku 4.5, finished')
+  // Reads at start and around the turn's end are done; the reuse itself reads no list.
+  listed = 0
   await stored($, 'delivery', 'One more thing.')
   expect((await row($, 'One more thing.')).alt).toBe('One more thing.: Haiku 4.5, running')
   expect(listed).toBe(0)
@@ -177,9 +179,20 @@ test('resume: a subagent at work with no row gets one, running, named from the e
 })
 
 test('resume: a message stored for a subagent with no row puts one up, running', async ($, on) => {
-  await engine($, on)
+  // The engine lists it, idle until the message wakes it.
+  await engine($, on, [{ id: 'lost', description: '', type: 'general-purpose', status: 'idle' }])
   await $.session.append({ agentId: 'lost', door: 'delivery', message: { type: 'user', content: [{ type: 'text', text: 'Pick this back up' }] } } as never)
   const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'desktop', component: 'Pane', requestId: 'crew-agents', props: pane })
   const alts = (await ui.findAll({ type: 'Svg' })).map(el => String(el.props.alt))
   expect(alts.some(a => a.startsWith('Pick this back up') && a.endsWith('running'))).toBe(true)
+})
+
+test("resume: a loop the engine's list does not name (its own fork for compaction or memory) gets no row", async ($, on) => {
+  await engine($, on)
+  await $.turn.start({ text: 'Summarize the conversation so far.', turnId: 'f1', agentId: 'fork-1' } as never)
+  await $.session.append({ agentId: 'fork-1', door: 'prompt', message: { type: 'user', content: [{ type: 'text', text: 'Summarize.' }] } } as never)
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'desktop', component: 'Pane', requestId: 'crew-agents', props: pane })
+  const alts = (await ui.findAll({ type: 'Svg' })).map(el => String(el.props.alt))
+  await ui.unmount()
+  expect(alts.filter(a => /, (running|finished)$/.test(a))).toEqual([])
 })

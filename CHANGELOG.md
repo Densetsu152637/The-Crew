@@ -6,6 +6,15 @@ Version bumps before 0.13.0 were not committed one by one, so entries before 0.1
 
 ## [Unreleased]
 
+### Fixed
+- The number of working subagents is right again. Which subagents are running now follows Claude Code's own agent list (`$.agent.list()` and each agent's `status`), read at start, at a subagent's turn end and a moment after it, and every 5 seconds while a subagent runs (never while nothing does). Before, the panel inferred it from spawn and turn-end events alone.
+  - A subagent whose turn ended while the engine holds it on background work it owns (`waiting`: a background command, an Agent call, a plan's approval) stays running instead of reading finished until it woke.
+  - A subagent with a tool call in flight (a permission prompt, a long command) stays running whatever the list says.
+  - A subagent the engine stopped without a turn end (`killed`, `failed`) is finished instead of running for good, and one the engine has at work with no row gets one.
+  - The band's `N running` counts the subagents at work, as the panel's Running section does. It counted only `savvy-*` Agent calls in flight, and a background call answers as soon as its agent starts, so it read 0 while agents worked.
+  - A loop the engine's list does not name (its own forks for compaction or memory) no longer gets a row of its own.
+- A subagent at work again goes first under Running however it is noticed. A model request or a tool call of a finished agent whose turn's start went unheard put it back to running where it stood, at the bottom of Running, under its old title; it is now renewed and moved first, as a resume or a message does. The collapsed strip orders its crabs the same way.
+
 ### Changed
 - A session opened again moves to the front of the store's index, so a session in use is the last one dropped, however long ago it was first saved.
 - Copies of sessions the Claude desktop app has archived are discarded at once: at start and every five minutes the panel reads the app's session records (`claude-code-sessions/**/local_*.json`), only those changed since the last scan, and drops the copies of those marked archived. The open session's copy is never dropped. Without the desktop app, nothing changes.

@@ -358,7 +358,9 @@ test('rows: every image is in flow and has an alt', async ($, on) => {
   expect(found.filter(f => !f.alt)).toHaveLength(0)
 })
 
-test('reuse: no timer is left once the agents finish, and the engine list is never polled', async ($, on) => {
+// The engine's list is read at start, at a subagent's turn end and once a moment after it, and every few
+// seconds only while a subagent runs: once the agents finish, nothing reads it or ticks.
+test('reuse: no timer is left once the agents finish, and the engine list is not polled after', async ($, on) => {
   let listed = 0
   on('agent.list', () => {
     listed++
@@ -367,8 +369,11 @@ test('reuse: no timer is left once the agents finish, and the engine list is nev
   const { clock } = await session($, on)
   await spawn($)
   await finish($)
+  await clock.advance(5000)
+  const settled = listed
+  expect(settled).toBeLessThanOrEqual(3)
   await clock.advance(600_000)
-  expect(listed).toBe(0)
+  expect(listed).toBe(settled)
   expect(await mainTime($)).toBe('0:00')
 })
 

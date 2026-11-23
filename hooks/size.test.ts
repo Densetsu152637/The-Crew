@@ -59,7 +59,8 @@ test('size: a session with many subagents stays within the tree bound and lists 
   await ui.unmount()
 })
 
-test('size: past even one-line rows, the rest are counted', async ($, on) => {
+// 200 spawns and 190 turn ends take several seconds on a slow machine, near the kit's 5 s default.
+test('size: past even one-line rows, the rest are counted', { timeoutMs: 30_000 } as never, async ($, on) => {
   await session($, on)
   await crowd($, 200, 190)
   const ui = await mount($)

@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, SessionContextUsage, SessionMessage, SessionUsage, Timer } from 'claude-code'
+import type { AgentInfo, AgentStatus as HostStatus, EngineInterface, Register, SessionContextUsage, SessionMessage, SessionUsage, Timer } from 'claude-code'
 
 import type { AgentRun, Flow, Panel, Phase, PlannedTask } from '../types'
 
@@ -179,6 +179,10 @@ const label = (f: Flow): string => {
   const count = f.total ? `${f.done}/${f.total}` : `${f.running} ${s.busy}`
   return `${f.phase === 'review' ? s.review : s.tasks} ${count}`
 }
+
+// The flow with its running count as the rows have it: the subagents at work now, whatever their type and
+// whether their Agent call has answered (a background one answers as soon as it starts).
+const withWorking = (f: Flow, list: readonly AgentRun[]): Flow => ({ ...f, running: list.filter(a => a.status === 'running').length })
 
 const ratio = (f: Flow): number => (f.isFinished ? 1 : f.total ? f.done / f.total : 0)
 
@@ -489,6 +493,40 @@ const renew = (list: AgentRun[], agentId: string, at: number, task?: Task): Agen
   const row = list.find(a => a.agentId === agentId)
   if (!row || row.status === 'running') return list
   return [...list.filter(a => a !== row), reused(row, at, task)]
+}
+
+// --- the engine's own word on its agents. `$.agent.list()` gives each agent loop of the session with where it
+// stands (AgentInfo.status); no event says when that changes. The rows follow the events, and the list settles
+// what they miss: a loop the engine holds after its turn ended, one stopped without a turn's end, one woken unheard.
+// How often the list is read while a subagent's row is running.
+const HOST_MS = 5000
+// The list may lag an event: within this time of one, a row keeps what the event said.
+const HOST_GRACE_MS = 2000
+// At work: not yet started, running a turn, or waiting (held on background work it owns, a plan's approval or
+// an Agent call). Idle between turns, or ended, is not.
+const isHostWorking = (s: HostStatus): boolean => s === 'pending' || s === 'running' || s === 'waiting'
+const hostEnd = (s: HostStatus): 'done' | 'failed' => (s === 'failed' || s === 'killed' ? 'failed' : 'done')
+
+// The rows as the engine's list has them. A finished row whose loop is at work there is running again, moved
+// first under Running; a running row whose loop has ended or gone idle is finished. A row the list does not
+// name keeps what its events said, and so does one `isHeld` names (a tool call of its own in flight, an event
+// heard within HOST_GRACE_MS). The same list comes back when nothing changed.
+const settle = (list: AgentRun[], host: readonly AgentInfo[], at: number, isHeld: (agentId: string) => boolean): AgentRun[] => {
+  const byId = new Map(host.map(h => [h.id, h]))
+  const woken: string[] = []
+  let isChanged = false
+  const ended = list.map((a): AgentRun => {
+    const h = a.agentId ? byId.get(a.agentId) : undefined
+    if (!h || !a.agentId) return a
+    if (isHostWorking(h.status)) {
+      if (a.status !== 'running' && at - (a.endedAt ?? 0) >= HOST_GRACE_MS) woken.push(a.agentId)
+      return a
+    }
+    if (a.status !== 'running' || isHeld(a.agentId)) return a
+    isChanged = true
+    return { ...a, status: hostEnd(h.status), endedAt: at }
+  })
+  return woken.reduce((out, id) => renew(out, id, at), isChanged ? ended : list)
 }
 
 type Planned = PlannedTask & { n: number }
@@ -926,6 +964,12 @@ const finishedAgents = new Set<string>()
 // A reused subagent always starts from a new input: a brief (`prompt`) or a message sent to it (`delivery`).
 // Its replies and tool results after it finished are not reuse.
 const REUSE_DOORS = new Set(['prompt', 'delivery'])
+// Per subagent: when an event last showed it at work, and how many of its tool calls are in flight (a
+// permission prompt and a long command included). Either holds its row running against the engine's list.
+const heardAt = new Map<string, number>()
+const inTool = new Map<string, number>()
+const isHeldAt = (at: number) => (agentId: string): boolean =>
+  (inTool.get(agentId) ?? 0) > 0 || at - (heardAt.get(agentId) ?? -Infinity) < HOST_GRACE_MS
 
 async function openThread($: EngineInterface, id: string, agentId: string, refresh: () => void): Promise<void> {
   viewingAgent = agentId
@@ -1089,12 +1133,83 @@ const paneSurfaces = new Set<string>()
 const isBusy = async ($: EngineInterface): Promise<boolean> =>
   (await read($, agents)).some(a => a.status === 'running') || (await read($, root))?.status === 'running'
 
+// Reads the engine's list every HOST_MS while a subagent's row is running, and once a moment after a
+// subagent's turn ends (`recheck`); never while nothing runs.
+let hostTimer: Timer | undefined
+let recheckTimer: Timer | undefined
+
 async function syncTicker($: EngineInterface): Promise<void> {
+  const isAgentBusy = (await read($, agents)).some(a => a.status === 'running')
+  if (isAgentBusy && !hostTimer) hostTimer = $.clock.every(HOST_MS, () => void reconcileHost($))
+  if (!isAgentBusy && hostTimer) {
+    hostTimer.cancel()
+    hostTimer = undefined
+  }
   const isDesktop = paneSurfaces.size > 0 && [...paneSurfaces].every(s => s === 'desktop')
-  const ms = (await isBusy($)) ? (isDesktop ? DESKTOP_MS : FAST_MS) : 0
+  const ms = isAgentBusy || (await read($, root))?.status === 'running' ? (isDesktop ? DESKTOP_MS : FAST_MS) : 0
   if (ticker?.ms === ms) return
   ticker?.timer.cancel()
   ticker = ms ? { ms, timer: $.clock.every(ms, () => void tick($)) } : undefined
+}
+
+// The engine's list, or nothing from a host without one.
+async function hostAgents($: EngineInterface): Promise<AgentInfo[] | undefined> {
+  try {
+    const listed = await $.agent.list()
+    return Array.isArray(listed) ? listed : undefined
+  } catch {
+    return undefined
+  }
+}
+
+// The rows settled against the engine's list (see `settle`), and a row for each agent the list has at work
+// that has none. Nothing is written when nothing changed.
+let isReconciling = false
+async function reconcileHost($: EngineInterface): Promise<void> {
+  if (isReconciling) return
+  isReconciling = true
+  try {
+    const host = await hostAgents($)
+    if (!host) return
+    const at = await $.clock.now()
+    const isHeld = isHeldAt(at)
+    const apply = (list: AgentRun[]): AgentRun[] => {
+      const settled = settle(list, host, at, isHeld)
+      const missing = host.filter(h => isHostWorking(h.status) && !list.some(a => a.agentId === h.id))
+      return missing.length ? [...settled, ...missing.map(h => newRun(h.id, at, h))] : settled
+    }
+    const list = await read($, agents)
+    if (apply(list) === list) return
+    const next = await update($, agents, apply)
+    for (const a of next) {
+      if (!a.agentId) continue
+      if (a.status === 'running') finishedAgents.delete(a.agentId)
+      else finishedAgents.add(a.agentId)
+    }
+    await update($, now, () => at)
+    await syncTicker($)
+  } finally {
+    isReconciling = false
+  }
+}
+
+// A subagent's turn ended: the list is read again a moment later, as it may not have caught up yet (a loop
+// the engine holds on its background work shows `waiting` only after the turn's end). A burst of ends reads it
+// once, after the last of them: one timer, put off while ends keep coming.
+const RECHECK_MS = HOST_GRACE_MS + 500
+let recheckDue = 0
+function recheck($: EngineInterface, at: number): void {
+  recheckDue = at + RECHECK_MS
+  if (recheckTimer) return
+  const wait = (ms: number): void => {
+    recheckTimer = $.clock.after(ms, async () => {
+      const t = await $.clock.now()
+      if (t < recheckDue) return wait(recheckDue - t)
+      recheckTimer = undefined
+      await reconcileHost($)
+    })
+  }
+  wait(RECHECK_MS)
 }
 
 // Ticks the running clocks (agents', and the main session's mid-turn).
@@ -1124,17 +1239,25 @@ const bandClock = async ($: EngineInterface): Promise<number> => {
 
 // A subagent at work with no row (dropped by an older version, folded out of a large stored copy, or
 // spawned before the panel loaded) gets one again, running, so its reuse shows. Its description and type
-// come from the engine's agent list when it answers. True when a row was added.
+// come from the engine's agent list. A loop the list does not name (the engine's own forks for compaction or
+// memory, which carry ids no list names) is no subagent and gets none; a host with no list names none, and
+// the row is then named from its task. True when a row was added.
 async function adoptAgent($: EngineInterface, agentId: string, at: number, prompt?: string): Promise<boolean> {
   if ((await read($, agents)).some(a => a.agentId === agentId)) return false
-  let info: { description?: string; type?: string; name?: string } | undefined
-  try {
-    info = (await $.agent.list()).find(l => l.id === agentId)
-  } catch {
-    // No agent list from this host: the row is named from its task.
-  }
+  const host = await hostAgents($)
+  const info = host?.find(l => l.id === agentId)
+  if (host && !info) return false
+  const run = newRun(agentId, at, info, prompt)
+  await update($, agents, list => (list.some(a => a.agentId === agentId) ? list : [...list, run]))
+  finishedAgents.delete(agentId)
+  heardAt.set(agentId, at)
+  return true
+}
+
+// A running row for an agent that had none, named from the engine's list or, without it, from its task.
+const newRun = (agentId: string, at: number, info?: { description?: string; type?: string; name?: string }, prompt?: string): AgentRun => {
   const type = info?.type || 'general-purpose'
-  const run: AgentRun = {
+  return {
     id: agentId,
     agentId,
     type,
@@ -1151,9 +1274,6 @@ async function adoptAgent($: EngineInterface, agentId: string, at: number, promp
     steps: 0,
     round: 1,
   }
-  await update($, agents, list => (list.some(a => a.agentId === agentId) ? list : [...list, run]))
-  finishedAgents.delete(agentId)
-  return true
 }
 
 // CALIBRATION (dev build only, removed before release): what the desktop pane reports as it scrolls, next
@@ -1183,6 +1303,11 @@ export const register: Register = (on, options) => {
     // A reload starts from nothing: no timer of the old module, no drawing kept.
     ticker?.timer.cancel()
     ticker = undefined
+    hostTimer?.cancel()
+    hostTimer = undefined
+    recheckTimer?.cancel()
+    recheckTimer = undefined
+    heardAt.clear()
     memo.reset()
     threads.clear()
     paneSurfaces.clear()
@@ -1282,6 +1407,8 @@ export const register: Register = (on, options) => {
       return usage ? withContext(dated, usage.context) : dated
     })
 
+    // What the engine has at work now: a reload or a resume finds its agents as they stand.
+    await reconcileHost($)
     await syncTicker($)
     // Once per session: a hot reload after the person closed the panel does not reopen it.
     if (options.openAtStart !== 'off') await autoOpen($, 'session-start')
@@ -1300,6 +1427,30 @@ export const register: Register = (on, options) => {
     return { text: isOpen ? tr().opened : tr().closed }
   })
 
+  // A subagent's tool call: while it is in flight (its permission prompt, a long command) the agent is at work,
+  // whatever the engine's list says. A call from a finished agent means it is at work again: its row is running,
+  // first under Running. Only those read the state; every other call is let go without a read.
+  on('tool.call', async ($, e, next) => {
+    const agentId = e.agentId
+    if (!agentId) return next(e)
+    inTool.set(agentId, (inTool.get(agentId) ?? 0) + 1)
+    try {
+      if (finishedAgents.has(agentId)) {
+        finishedAgents.delete(agentId)
+        const at = await $.clock.now()
+        heardAt.set(agentId, at)
+        if (!(await adoptAgent($, agentId, at))) await update($, agents, list => renew(list, agentId, at))
+        await update($, now, () => at)
+        await syncTicker($)
+      }
+      return await next(e)
+    } finally {
+      const left = (inTool.get(agentId) ?? 1) - 1
+      if (left > 0) inTool.set(agentId, left)
+      else inTool.delete(agentId)
+    }
+  })
+
   on('tool.call', { tool: TOOL }, async ($, e) => {
     // The flow is the main session's: a call from a worker's loop carries its agentId
     // and changes nothing, or any subagent could rename, finish or reset the flow.
@@ -1313,7 +1464,7 @@ export const register: Register = (on, options) => {
     }
     const next = await update($, flow, p => merge(p, input))
     if (next && input.tasks?.length) await autoOpen($, next.title)
-    return { result: `ok: ${label(next ?? blank())}` }
+    return { result: `ok: ${label(withWorking(next ?? blank(), await read($, agents)))}` }
   })
 
   // A worker's own progress: the call runs in the worker's loop, so agentId names it.
@@ -1334,20 +1485,18 @@ export const register: Register = (on, options) => {
     return { result: matched ? 'ok' : `ignored: no panel row for agent ${agentId}` }
   })
 
-  // Safety net: worker launches move the faint layer even if the orchestrator forgets to report.
+  // Safety net: a savvy worker's launch puts up the band, in its delegate phase, even if the orchestrator forgets
+  // to report. Its running count is the rows' (`withWorking`), not a count of Agent calls in flight: a background
+  // call answers as soon as its agent starts, and the count read 0 while the agent worked.
   on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
     const type = String(e.subagent_type ?? '')
     if (!type.startsWith('savvy-')) return next(e)
 
     await update($, flow, prev => {
       const base = prev && !prev.isFinished ? { ...blank(), ...prev } : blank()
-      return { ...base, running: base.running + 1, phase: base.phase === 'plan' ? 'delegate' : base.phase }
+      return { ...base, phase: base.phase === 'plan' ? 'delegate' : base.phase }
     })
-    try {
-      return await next(e)
-    } finally {
-      await update($, flow, prev => (prev ? { ...prev, running: Math.max(0, prev.running - 1) } : prev))
-    }
+    return next(e)
   })
 
   // A message to a finished subagent resumes it with a new task: its row is renewed
@@ -1369,6 +1518,7 @@ export const register: Register = (on, options) => {
     if (!row || row.status === 'running') return next(e)
     const at = await $.clock.now()
     finishedAgents.delete(row.agentId as string)
+    heardAt.set(row.agentId as string, at)
     await update($, agents, rows => renew(rows, row.agentId as string, at, { summary: input.summary, prompt: input.message }))
     await update($, now, () => at)
     await syncTicker($)
@@ -1389,6 +1539,7 @@ export const register: Register = (on, options) => {
     if (resumed && before) {
       const at = await $.clock.now()
       finishedAgents.delete(resumed)
+      heardAt.set(resumed, at)
       await update($, agents, list => renew(list, resumed, at, { prompt: e.prompt }))
       await update($, now, () => at)
       await syncTicker($)
@@ -1435,6 +1586,10 @@ export const register: Register = (on, options) => {
       // Every row is kept: a cap dropped the oldest ones, their totals with them, and a reused one never showed running.
       return [...list.filter(a => a.id !== run.id), run]
     })
+    if (started.agentId) {
+      finishedAgents.delete(started.agentId)
+      heardAt.set(started.agentId, at)
+    }
     await update($, now, () => at)
     await syncTicker($)
     if (e.subagentType.startsWith('savvy-')) {
@@ -1452,6 +1607,7 @@ export const register: Register = (on, options) => {
     const started = await next(e)
     const agentId = e.agentId
     const at = await $.clock.now()
+    if (agentId !== undefined) heardAt.set(agentId, at)
     if (agentId === undefined) {
       await update($, root, (prev): AgentRun => ({ ...(prev ?? newRoot(at)), status: 'running' }))
       await update($, now, () => at)
@@ -1497,7 +1653,15 @@ export const register: Register = (on, options) => {
     }
 
     const model = usage.model || e.model
-    await adoptAgent($, agentId, await $.clock.now())
+    const at = await $.clock.now()
+    heardAt.set(agentId, at)
+    await adoptAgent($, agentId, at)
+    // A step of a finished agent whose turn's start went unheard: running again, first under Running, as a
+    // turn's start would have put it.
+    if (finishedAgents.has(agentId)) {
+      finishedAgents.delete(agentId)
+      await update($, agents, list => renew(list, agentId, at))
+    }
     await update($, agents, list =>
       list.map((a): AgentRun =>
         a.agentId !== agentId
@@ -1534,6 +1698,7 @@ export const register: Register = (on, options) => {
     if (REUSE_DOORS.has(e.door) && (finishedAgents.has(agentId) || !(await read($, agents)).some(a => a.agentId === agentId && a.status === 'running'))) {
       finishedAgents.delete(agentId)
       const at = await $.clock.now()
+      heardAt.set(agentId, at)
       // The row carries the new task's brief.
       const content = e.message.content as unknown
       const text = Array.isArray(content) ? content.map(b => (b as { text?: unknown }).text).find(t => typeof t === 'string') : content
@@ -1554,7 +1719,12 @@ export const register: Register = (on, options) => {
     if (agentId) {
       const at = await $.clock.now()
       touchThread(agentId)
-      finishedAgents.add(agentId)
+      // A turn ended, but the engine may hold the agent's loop on work it owns (a background command, an Agent
+      // call, a plan's approval): it is still at work, and its row stays running until the list says it ended.
+      const host = e.reason === 'aborted' ? undefined : (await hostAgents($))?.find(h => h.id === agentId)
+      const isHeld = host?.status === 'waiting'
+      if (isHeld) heardAt.set(agentId, at)
+      else finishedAgents.add(agentId)
       // Its conversation is read only while its thread is open (the render keeps that copy); a row follows its events alone.
       await update($, agents, list =>
         list.map((a): AgentRun => {
@@ -1564,8 +1734,7 @@ export const register: Register = (on, options) => {
           const fallback = a.steps === 0 && e.usage
           return {
             ...a,
-            status: e.reason === 'answer' ? 'done' : 'failed',
-            endedAt: at,
+            ...(isHeld ? {} : { status: (e.reason === 'answer' ? 'done' : 'failed') as AgentRun['status'], endedAt: at }),
             ...(fallback && e.usage
               ? {
                   model: e.usage.model || a.model,
@@ -1579,6 +1748,7 @@ export const register: Register = (on, options) => {
       )
       await update($, now, () => at)
       await syncTicker($)
+      recheck($, at)
     } else {
       // The main loop's turn ended: its row rests until the next prompt.
       const at = await $.clock.now()
@@ -1788,7 +1958,7 @@ export const register: Register = (on, options) => {
           <Box flexDirection="column">
             <Svg source={header} alt={title ? `${title}: ${summary}` : summary} width={W} height={headerHeight(title)} />
             {toggleCompact}
-            <Svg source={compactSvg(W, everyone, planned)} alt={`${list.length} ${s.agentsCount}`} width={W} height={32} />
+            <Svg source={compactSvg(W, [...(main ? [main] : []), ...running, ...finished], planned)} alt={`${list.length} ${s.agentsCount}`} width={W} height={32} />
           </Box>
         )
       }
@@ -1957,8 +2127,8 @@ export const register: Register = (on, options) => {
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    const f = await read($, flow)
-    if (f === null || e.props.hasSurvey) return next(e)
+    const stored = await read($, flow)
+    if (stored === null || e.props.hasSurvey) return next(e)
     // Draw this row with the other mods' bands beneath it. Claude Code's own placeholder ({ type: 'engine' }) is
     // never nested: the desktop drops a band that nests it.
     const drawn = await Promise.resolve(next(e)).catch(() => null)
@@ -1967,8 +2137,10 @@ export const register: Register = (on, options) => {
     const ui = $.ui.resolve(e)
     const { Box, Text, Button } = ui
     const list = await read($, agents)
+    // The band's running count is the subagents at work now, as the panel's Running section counts them.
+    const f = withWorking(stored, list)
     const crew = list.length + plannedOf(f, list).length
-    const isWorking = list.some(a => a.status === 'running')
+    const isWorking = f.running > 0
     const crewButton = (
       <Button key="crew-agents" label={`×${crew}`} plain onPress={() => void togglePane($)} />
     )

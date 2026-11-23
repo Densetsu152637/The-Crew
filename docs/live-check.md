@@ -12,12 +12,13 @@
 6. **Status dot pulse.** A running row's status mark pulses; a finished row's does not.
 7. **Subagent thread.** Press a subagent row's name. The list is replaced by that agent's brief, replies and a line per tool call, opening at the newest message. While the agent still runs, new messages appear without reopening the thread, and the view follows them while you are at the bottom; scroll up and it stays put, scroll back to the end and it follows again.
 8. **Back button.** **‹ Agents** at the top, and again below the newest message, returns to the list.
-9. **Reused subagent.** Message a finished subagent again (SendMessage or a resume). It moves back to Running, its title becomes the new task, its cost and tokens are kept, and its timer leaves out the time it sat finished.
-10. **Band progress bar.** Have the main session call `mcp__the-crew__progress` with a title, tasks and a phase. A bar with its label and percent appears above the prompt, advances with `done`, shows finished with `finished: true`, and **✕** dismisses it. The crew button in the band opens the panel.
-11. **Step reporting.** A worker that calls `mcp__the-crew__step` shows a bar of its own steps and the note; one that does not shows its context fill in grey.
-12. **Light and dark theme.** Switch the app between light and dark: text, rows, bars, dividers and status marks stay legible, the crabs keep their contrast, and no drawing sits on a white or black box.
-13. **Collapse.** The collapse control shrinks the rows to a strip of crabs and keeps the header tiles; expanding restores the list.
-14. **Reduced motion.** With the operating system's reduce-motion setting on, no crab animates.
+9. **Reused subagent.** Message a finished subagent again (SendMessage or a resume). It moves back to the top of Running, its title becomes the new task, its cost and tokens are kept, and its timer leaves out the time it sat finished.
+10. **Running count.** With several subagents at work, Running · N (and the band's `N running`, for a flow reported without a total) equals the subagents actually working. A subagent waiting on a permission prompt, or on its own background command, stays under Running; one stopped from the tasks view leaves it within a few seconds.
+11. **Band progress bar.** Have the main session call `mcp__the-crew__progress` with a title, tasks and a phase. A bar with its label and percent appears above the prompt, advances with `done`, shows finished with `finished: true`, and **✕** dismisses it. The crew button in the band opens the panel.
+12. **Step reporting.** A worker that calls `mcp__the-crew__step` shows a bar of its own steps and the note; one that does not shows its context fill in grey.
+13. **Light and dark theme.** Switch the app between light and dark: text, rows, bars, dividers and status marks stay legible, the crabs keep their contrast, and no drawing sits on a white or black box.
+14. **Collapse.** The collapse control shrinks the rows to a strip of crabs and keeps the header tiles; expanding restores the list.
+15. **Reduced motion.** With the operating system's reduce-motion setting on, no crab animates.
 
 Record the outcome in the release notes or the PR: Claude Code version, platform, and any item that failed.
 
